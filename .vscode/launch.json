@@ -1,0 +1,73 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (ESP32-C6)",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/build/blink.elf",
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:HOME}/.espressif/tools/riscv32-esp-elf-gdb/14.2_20240403/riscv32-esp-elf-gdb/bin/riscv32-esp-elf-gdb",
+            "miDebuggerServerAddress": "localhost:3333",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "text": "set remote hardware-watchpoint-limit 2"
+                },
+                {
+                    "text": "set mem inaccessible-by-default off"
+                }
+            ],
+            "externalConsole": false,
+            "debugServerPath": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/bin/openocd",
+            "debugServerArgs": "-s ${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts -f interface/esp_usb_jtag.cfg -f target/esp32c6.cfg",
+            "serverStarted": "Listening on port 3333 for gdb connections",
+            "filterStdout": true,
+            "filterStderr": true,
+            "stopAtConnect": true,
+            "preLaunchTask": "Flash ESP-IDF",
+            "logging": {
+                "engineLogging": false
+            }
+        },
+        {
+            "name": "Debug (ESP32-S3)",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/build/blink.elf",
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:HOME}/.espressif/tools/xtensa-esp-elf-gdb/14.2_20240403/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb",
+            "miDebuggerServerAddress": "localhost:3333",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "text": "set remote hardware-watchpoint-limit 2"
+                },
+                {
+                    "text": "set mem inaccessible-by-default off"
+                }
+            ],
+            "externalConsole": false,
+            "debugServerPath": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/bin/openocd",
+            "debugServerArgs": "-s ${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts -f interface/esp_usb_jtag.cfg -f target/esp32s3.cfg",
+            "serverStarted": "Listening on port 3333 for gdb connections",
+            "filterStdout": true,
+            "filterStderr": true,
+            "stopAtConnect": true,
+            "preLaunchTask": "Flash ESP-IDF",
+            "logging": {
+                "engineLogging": false
+            }
+        }
+    ]
+}

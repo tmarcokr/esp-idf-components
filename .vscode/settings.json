@@ -1,0 +1,48 @@
+{
+    "clangd.arguments": [
+        "--compile-commands-dir=build",
+        "--query-driver=**/*g++",
+        "--header-insertion=never"
+    ],
+    "cmake.configureEnvironment": {
+        "IDF_PATH": "${env:HOME}/esp/esp-idf",
+        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/",
+        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts"
+    },
+    "cmake.buildEnvironment": {
+        "IDF_PATH": "${env:HOME}/esp/esp-idf",
+        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/",
+        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts"
+    },
+    "cmake.generator": "Ninja",
+    "cmake.configureOnOpen": true,
+    "cmake.configureArgs": [
+        "-DCMAKE_TOOLCHAIN_FILE=${env:HOME}/esp/esp-idf/tools/cmake/toolchain-esp32c6.cmake"
+    ],
+    "idf.espIdfPath": "${env:HOME}/esp/esp-idf",
+    "idf.customExtraPaths": "${env:HOME}/.espressif/tools/xtensa-esp-elf-gdb/14.2_20240403/xtensa-esp-elf-gdb/bin:${env:HOME}/.espressif/tools/riscv32-esp-elf-gdb/14.2_20240403/riscv32-esp-elf-gdb/bin:${env:HOME}/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin:${env:HOME}/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin:${env:HOME}/.espressif/tools/esp32-elf-rom-elf-debugger/20241016/esp32-elf-rom-elf-debugger/bin:${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/bin:${env:HOME}/.espressif/tools/esp-rom-elfs/20240305",
+    "idf.customExtraVars": {
+        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts",
+        "IDF_CCACHE_ENABLE": "1",
+        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/"
+    },
+    "idf.pythonBinPath": "${env:HOME}/.espressif/python_env/idf5.4_py3.13_env/bin/python",
+    "idf.toolsPath": "${env:HOME}/.espressif",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+    "git.ignoredRepositories": [
+        "${env:HOME}/esp/esp-idf",
+        "${workspaceFolder}/managed_components"
+    ],
+    "files.exclude": {
+        "managed_components": true,
+        "build": true
+    },
+    "files.autoSave": "afterDelay",
+    "files.autoSaveDelay": 500,
+    "diffEditor.renderSideBySide": true,
+    "diffEditor.useInlineViewWhenSpaceIsLimited": false,
+    "editor.mouseWheelZoom": true,
+    "workbench.editorAssociations": {
+    "*.md": "vscode.markdown.preview.editor"
+}
+}

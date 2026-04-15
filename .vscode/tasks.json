@@ -1,0 +1,102 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Set ESP-IDF Target",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py set-target ${input:espTarget}",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "ESP-IDF Menuconfig",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py menuconfig",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "focus": true,
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Kill Monitor",
+            "type": "shell",
+            "command": "pkill -f 'idf.py.*monitor' || pkill -f 'idf_monitor' || fuser -k /dev/ttyACM1 || true",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "never",
+                "close": true
+            }
+        },
+        {
+            "label": "Build ESP-IDF",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Flash ESP-IDF",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py flash",
+            "group": "build",
+            "dependsOn": ["Kill Monitor"],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Monitor ESP-IDF",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py monitor",
+            "group": "none",
+            "dependsOn": ["Kill Monitor"],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        },
+        {
+            "label": "Flash and Monitor ESP-IDF",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py flash monitor",
+            "group": "none",
+            "dependsOn": ["Kill Monitor"],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "espTarget",
+            "type": "pickString",
+            "description": "Select the ESP32 target chip for this project:",
+            "options": [
+                "esp32",
+                "esp32s3",
+                "esp32c6"
+            ],
+            "default": "esp32c6"
+        }
+    ]
+}
