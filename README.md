@@ -4,7 +4,7 @@
 !C++ Standard
 !License
 
-Welcome to a professional, highly modular collection of hardware drivers for the ESP32 ecosystem (specifically tailored and tested for the ESP32-C6 and ESP32-S3). 
+Welcome to a highly modular collection of hardware drivers for the ESP32 ecosystem (specifically tailored and tested for the ESP32-C6 and ESP32-S3). 
 
 This repository separates complex hardware protocols (I2S, I2C, SPI) from application logic, providing clean, reusable, and thread-safe **C++20 APIs**. Whether you are building a custom lightsaber, an RC car, or an IoT drone, these components are designed to be "Copy & Paste" ready.
 
@@ -26,12 +26,12 @@ A robust I2S driver for the MAX98357A Class-D amplifier.
 - Features a strict **Anti-Pop sequence** during power-on.
 - Abstracted DMA buffering for skip-free audio.
 
-### 2. Motion Processing (`mpu6050`) *(Coming Soon)*
+### 2. Motion Processing (`mpu6050`)
 Advanced wrapper for the MPU-6050 IMU.
 - Integrates the v6.12 DMP (Digital Motion Processor) blob.
 - Real-time gravity-filtered quaternions and linear acceleration.
 
-### 3. SD Card SPI (`sd_card`) *(Coming Soon)*
+### 3. SD Card SPI (`sd_card`)
 Fast and thread-safe wrapper for standard SD cards using the SPI bus.
 
 ---
