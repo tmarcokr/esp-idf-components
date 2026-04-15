@@ -1,0 +1,22 @@
+CompileFlags:
+  CompilationDatabase: "build"
+
+  Add:
+    - "-D__GLIBC_USE(x)=0"
+
+  Remove: 
+    - "-fno-shrink-wrap"
+    - "-fno-shrink-warp"
+    - "-fstrict-volatile-bitfields"
+    - "-fno-tree-switch-conversion"
+    - "-march=*"
+    - "-mabi=*"
+    - "-mlongcalls"
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - "unused-includes"
