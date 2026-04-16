@@ -1,7 +1,15 @@
-# Critical Project Context
+# Project Context & Bootstrapper
 
-> [!IMPORTANT]
-> **Foundational Mandate:** You MUST read and adhere to the core project instructions and orchestration rules defined in:
-> `.agents/rules/01-project-instructions.md`
->
-> This file contains the mandatory agent identity, communication protocols (English-only technical output), and the strict routing logic for skills and workflows. Do not proceed with specialized tasks without consulting this foundational document.
+## ⚠️ MANDATORY INITIALIZATION
+**Stop.** Before performing any analysis or action, you **MUST** execute `read_file` on:
+`.agents/rules/01-project-instructions.md`
+
+This is a foundational requirement of the ecosystem template. That file contains your mandatory identity, communication protocols (English-only technical output), and the logic for autonomous skill activation. Failure to load these rules will result in an incorrect execution state.
+
+---
+
+## 🏗️ Project-Specific Overrides
+*Add local context below this line without modifying the mandate above.*
+
+- **Target**: This project is a collection of reusable ESP32 components and examples.
+- **Root Directory**: Do not run `idf.py` here; always use the `examples/` subdirectories.

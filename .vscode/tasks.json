@@ -6,6 +6,9 @@
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py set-target ${input:espTarget}",
             "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
+            },
             "presentation": {
                 "reveal": "always"
             }
@@ -15,6 +18,9 @@
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py menuconfig",
             "problemMatcher": [],
+            "options": {
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
+            },
             "presentation": {
                 "reveal": "always",
                 "focus": true,
@@ -43,7 +49,7 @@
                 "$gcc"
             ],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
             },
             "presentation": {
                 "reveal": "always"
@@ -58,7 +64,7 @@
             "dependsOrder": "sequence",
             "problemMatcher": [],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
             }
         },
         {
@@ -68,9 +74,10 @@
             "group": "none",
             "dependsOn": ["Kill Monitor"],
             "dependsOrder": "sequence",
+            
             "problemMatcher": [],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
             }
         },
         {
@@ -82,11 +89,25 @@
             "dependsOrder": "sequence",
             "problemMatcher": [],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
             }
         }
     ],
     "inputs": [
+        {
+            "id": "selectedProject",
+            "type": "pickString",
+            "description": "Select the example project to work with:",
+            "options": [
+                "01_gpio_button",
+                "02_audio_tone",
+                "03_mpu6050_dmp",
+                "04_sd_card_basic",
+                "05_rgb_led",
+                "06_sd_audio_player"
+            ],
+            "default": "01_gpio_button"
+        },
         {
             "id": "espTarget",
             "type": "pickString",
@@ -100,3 +121,4 @@
         }
     ]
 }
+
