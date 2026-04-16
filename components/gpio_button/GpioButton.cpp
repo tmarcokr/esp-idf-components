@@ -28,7 +28,7 @@ esp_err_t GpioButton::init() {
 
     _initialized = true;
 
-    BaseType_t ret = xTaskCreate(pollTask, "gpio_btn_tsk", 2048, this, 5, &_task_handle);
+    BaseType_t ret = xTaskCreate(pollTask, "gpio_btn_tsk", 4096, this, 5, &_task_handle);
     return (ret == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 
