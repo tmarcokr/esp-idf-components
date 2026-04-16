@@ -6,11 +6,20 @@
 static const char *TAG = "BUTTON_EXAMPLE";
 
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "Starting GPIO Button Example...");
+    // Select BOOT button GPIO based on target chip:
+    // ESP32-C6 DevKit uses GPIO 9 for the BOOT button.
+    // ESP32 and ESP32-S3 DevKits typically use GPIO 0 for the BOOT button.
+#if CONFIG_IDF_TARGET_ESP32C6
+    constexpr gpio_num_t BUTTON_GPIO = GPIO_NUM_9;
+#else
+    constexpr gpio_num_t BUTTON_GPIO = GPIO_NUM_0;
+#endif
 
-    // Configure the button on GPIO 9 (Typically the BOOT button on modern ESP32s)
+    ESP_LOGI(TAG, "Starting GPIO Button Example on GPIO %d...", BUTTON_GPIO);
+
+    // Configure the button
     // With `true`, we activate the internal Pull-up resistor (Button is pulled to GND when pressed)
-    Espressif::Wrappers::GpioButton btn(GPIO_NUM_9, true);
+    Espressif::Wrappers::GpioButton btn(BUTTON_GPIO, true);
 
     // Bind actions to button events using lambda expressions
     btn.onEvent(Espressif::Wrappers::ButtonEvent::PressDown, []() {
