@@ -6,10 +6,21 @@
 static const char *TAG = "RGB_LED_EXAMPLE";
 
 extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "Starting RGB LED Example...");
+    // Select GPIO based on target chip:
+#if CONFIG_IDF_TARGET_ESP32S3
+    constexpr gpio_num_t LED_GPIO = GPIO_NUM_48; // ESP32-S3-DevKitC-1
+#elif CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2
+    constexpr gpio_num_t LED_GPIO = GPIO_NUM_8;  // ESP32-C3/C6/H2 DevKits
+#elif CONFIG_IDF_TARGET_ESP32S2
+    constexpr gpio_num_t LED_GPIO = GPIO_NUM_18; // ESP32-S2-Saola
+#else
+    constexpr gpio_num_t LED_GPIO = GPIO_NUM_2;  // Default fallback for classic ESP32
+#endif
 
-    // Configure an RGB LED on GPIO 8 (Typical pin for the built-in WS2812 on chips like ESP32-C3/C6)
-    Espressif::Wrappers::RgbLed led(GPIO_NUM_8, 1);
+    ESP_LOGI(TAG, "Starting RGB LED Example on GPIO %d...", LED_GPIO);
+
+    // Configure an RGB LED
+    Espressif::Wrappers::RgbLed led(LED_GPIO, 1);
 
     if (led.init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize RGB LED!");
