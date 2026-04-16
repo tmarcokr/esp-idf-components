@@ -2,6 +2,16 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "Post-Build Sync (Clangd)",
+            "type": "shell",
+            "command": "ln -sf ${workspaceFolder}/examples/${input:selectedProject}/build ${workspaceFolder}/build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "never",
+                "close": true
+            }
+        },
+        {
             "label": "Set ESP-IDF Target",
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py set-target ${input:espTarget}",
@@ -11,7 +21,9 @@
             },
             "presentation": {
                 "reveal": "always"
-            }
+            },
+            "dependsOn": ["Post-Build Sync (Clangd)"],
+            "dependsOrder": "sequence"
         },
         {
             "label": "ESP-IDF Menuconfig",
@@ -25,7 +37,9 @@
                 "reveal": "always",
                 "focus": true,
                 "panel": "shared"
-            }
+            },
+            "dependsOn": ["Post-Build Sync (Clangd)"],
+            "dependsOrder": "sequence"
         },
         {
             "label": "Kill Monitor",
@@ -53,14 +67,16 @@
             },
             "presentation": {
                 "reveal": "always"
-            }
+            },
+            "dependsOn": ["Post-Build Sync (Clangd)"],
+            "dependsOrder": "sequence"
         },
         {
             "label": "Flash ESP-IDF",
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py flash",
             "group": "build",
-            "dependsOn": ["Kill Monitor"],
+            "dependsOn": ["Kill Monitor", "Post-Build Sync (Clangd)"],
             "dependsOrder": "sequence",
             "problemMatcher": [],
             "options": {
@@ -72,9 +88,8 @@
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py monitor",
             "group": "none",
-            "dependsOn": ["Kill Monitor"],
+            "dependsOn": ["Kill Monitor", "Post-Build Sync (Clangd)"],
             "dependsOrder": "sequence",
-            
             "problemMatcher": [],
             "options": {
                 "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
@@ -85,7 +100,7 @@
             "type": "shell",
             "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py flash monitor",
             "group": "none",
-            "dependsOn": ["Kill Monitor"],
+            "dependsOn": ["Kill Monitor", "Post-Build Sync (Clangd)"],
             "dependsOrder": "sequence",
             "problemMatcher": [],
             "options": {
@@ -121,4 +136,3 @@
         }
     ]
 }
-
