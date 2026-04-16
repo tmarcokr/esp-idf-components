@@ -16,19 +16,29 @@ Use this workflow when you have completed a feature, bug fix, or documentation u
    - Write the PR title using the mandatory prefix.
    - Fill the **Description**, **Implementation**, and **Obs** sections strictly in **English** using H1 headers (`# `).
 
-3. **Auditor Review**:
+3. **History Cleanup (Rebase & Squash)**:
+   - Ensure your branch is updated with the latest code from `main` following the **`.agents/workflows/git_rebase_main.md`** workflow.
+   - Squash your commits into a single cohesive functional commit following the **`.agents/workflows/git_squash_commits.md`** workflow.
+
+4. **Auditor Review**:
    - Request a quality check from the **Quality Auditor Skill**.
    - Ensure RAII, C++20 standards, and commenting policies are met.
 
-4. **Final Output**:
-   - Present the formatted Markdown code to the user.
+5. **Final Output**:
+   - Present the formatted Markdown code (Title and Body) to the user for confirmation.
 
-5. **Publish Branch**:
-   - Push your finalized branch to the remote repository:
+6. **Publish & Create PR**:
+   - Push your finalized branch (using force push since history was rewritten):
      ```bash
-     gpsup
+     gpf!
      ```
-   - *Note:* `gpsup` is the oh-my-zsh alias for `git push -u origin <branch_name>` (Pushes the current branch and sets the remote as upstream).
+   - *Note:* `gpf!` is the oh-my-zsh alias for `git push --force-with-lease`.
+   - Create the Pull Request using the GitHub CLI:
+     ```bash
+     gh pr create --title "<TITLE>" --body "<MARKDOWN_CONTENT>"
+     ```
+   - **Important**: You MUST show the Title and Body to the user and ask for confirmation before executing `gh pr create`.
+   - **Fallback**: If `gh` fails, provide the Markdown and manual URL.
 
 ---
 
