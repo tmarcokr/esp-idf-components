@@ -31,3 +31,11 @@ You are prohibited from modifying or proposing code changes without first execut
 ## 3. General Project Context
 - **Target Microcontrollers**: Generic ESP-IDF project (ESP32, ESP32-S3, ESP32-C6).
 - **Documentation**: Datasheets are located in `.agents/docs/`. Always consult them when dealing with hardware.
+
+## 4. Git Governance & Safety Protocols (Hard Rules)
+- **Main Branch Protection**: Direct commits to `main` or `master` are STRICTLY PROHIBITED. Every change MUST happen in a `feature/` branch followed by a Pull Request.
+- **Terminal Warning Sensitivity**: You MUST treat any "Bypassed rule violations" or "Remote rejected" message from Git as a CRITICAL FAILURE. 
+  - Action: Stop all operations immediately.
+  - Action: Report the violation to the user.
+  - Action: Do NOT attempt to "fix" it by forcing; instead, move the work to a new branch and start a PR.
+- **PR-First Culture**: Even if the user asks for a "quick fix", you must default to creating a branch and a PR unless the user explicitly uses the phrase "FORCE COMMIT TO MAIN".
