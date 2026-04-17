@@ -5,7 +5,8 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build_matrix:
+    name: Build ${{ matrix.example }} for ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -32,3 +33,17 @@ jobs:
           esp_idf_version: 'v5.2.1'
           target: ${{ matrix.target }}
           path: "examples/${{ matrix.example }}"
+
+  esp32_build_job:
+    name: ESP-IDF Final Build Status
+    needs: build_matrix
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check Matrix Results
+        run: |
+          if [[ "${{ needs.build_matrix.result }}" != "success" ]]; then
+            echo "One or more builds in the matrix failed."
+            exit 1
+          fi
+          echo "All builds passed successfully."
