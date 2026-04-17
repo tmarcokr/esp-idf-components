@@ -1,0 +1,36 @@
+name: ESP-IDF Build Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [
+          "01_gpio_button",
+          "02_audio_tone",
+          "03_mpu6050_dmp",
+          "04_sd_card_basic",
+          "05_rgb_led",
+          "06_sd_audio_player"
+        ]
+        target: [ "esp32s3", "esp32c6" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: 'v5.2.1'
+          target: ${{ matrix.target }}
+          path: "examples/${{ matrix.example }}"
