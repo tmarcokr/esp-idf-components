@@ -106,6 +106,27 @@
             "options": {
                 "cwd": "${workspaceFolder}/examples/${input:selectedProject}"
             }
+        },
+        {
+            "label": "Build Component HIL Test",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && idf.py -C ${env:HOME}/esp/esp-idf/tools/unit-test-app -D EXTRA_COMPONENT_DIRS=\"${workspaceFolder}/components\" -D TEST_COMPONENTS=\"${input:selectedComponent}\" -D IDF_TARGET=${input:espTarget} build",
+            "problemMatcher": ["$gcc"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "Run HIL Hardware Test",
+            "type": "shell",
+            "command": "source ${env:HOME}/esp/esp-idf/export.sh && pytest --embedded-services idf,serial --target ${input:espTarget} --binary-path ${env:HOME}/esp/esp-idf/tools/unit-test-app/build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "dependsOn": ["Kill Monitor"]
         }
     ],
     "inputs": [
@@ -121,7 +142,19 @@
                 "05_rgb_led",
                 "06_sd_audio_player"
             ],
-            "default": "01_gpio_button"
+            "default": "05_rgb_led"
+        },
+        {
+            "id": "selectedComponent",
+            "type": "pickString",
+            "description": "Select the component to test:",
+            "options": [
+                "rgb_led",
+                "gpio_button",
+                "mpu6050",
+                "sd_card"
+            ],
+            "default": "rgb_led"
         },
         {
             "id": "espTarget",
