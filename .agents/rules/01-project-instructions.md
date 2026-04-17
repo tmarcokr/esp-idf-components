@@ -28,6 +28,14 @@ You are prohibited from modifying or proposing code changes without first execut
 - If the user asks to "create a sample", read `skill_create_sample.md`.
 - If the user asks to "validate hardware", read `skill_hardware_validation.md`.
 
-## 3. General Project Context
+## 3. Git Governance & Safety Protocols (Hard Rules)
+- **Main Branch Protection**: Direct commits to `main` or `master` are STRICTLY PROHIBITED. Every change MUST happen in a `feature/` branch followed by a Pull Request.
+- **Terminal Warning Sensitivity**: You MUST treat any "Bypassed rule violations" or "Remote rejected" message from Git as a CRITICAL FAILURE. 
+  - Stop all operations immediately.
+  - Report the violation to the user.
+  - Do NOT attempt to "fix" it by forcing; instead, move the work to a new branch and start a PR.
+- **PR-First Culture**: Default to creating a branch and a PR for any code modification. Only use direct commits if the user explicitly says "FORCE COMMIT TO MAIN".
+
+## 4. General Project Context
 - **Target Microcontrollers**: Generic ESP-IDF project (ESP32, ESP32-S3, ESP32-C6).
 - **Documentation**: Datasheets are located in `.agents/docs/`. Always consult them when dealing with hardware.
