@@ -62,18 +62,18 @@ public:
    */
   void fadeTo(const Color &target, uint32_t duration_ms, uint32_t steps = 50);
 
+  /**
+   * @brief Linear interpolation between two 8-bit values.
+   */
+  static uint8_t interpolate(uint8_t start, uint8_t end, uint32_t step,
+                             uint32_t total_steps);
+
 private:
   gpio_num_t _gpio_num;
   uint32_t _max_leds;
   led_strip_handle_t _handle;
   Color _current_color;
   bool _initialized;
-
-  /**
-   * @brief Linear interpolation between two 8-bit values.
-   */
-  static uint8_t interpolate(uint8_t start, uint8_t end, uint32_t step,
-                             uint32_t total_steps);
 };
 
 } // namespace Espressif::Wrappers
