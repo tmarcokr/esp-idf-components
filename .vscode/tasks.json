@@ -119,7 +119,8 @@
                 "03_mpu6050_dmp",
                 "04_sd_card_basic",
                 "05_rgb_led",
-                "06_sd_audio_player"
+                "06_sd_audio_player",
+                "07_smart_led"
             ],
             "default": "01_gpio_button"
         },
