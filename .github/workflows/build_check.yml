@@ -17,7 +17,8 @@ jobs:
           "03_mpu6050_dmp",
           "04_sd_card_basic",
           "05_rgb_led",
-          "06_sd_audio_player"
+          "06_sd_audio_player",
+          "07_smart_led"
         ]
         target: [ "esp32s3", "esp32c6" ]
 
@@ -30,7 +31,7 @@ jobs:
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: 'v5.2.1'
+          esp_idf_version: 'v5.4.1'
           target: ${{ matrix.target }}
           path: "examples/${{ matrix.example }}"
 

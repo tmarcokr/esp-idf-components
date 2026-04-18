@@ -41,6 +41,13 @@ RAII-compliant wrapper for standard SD cards using the SPI bus.
 - **`gpio_button`**: Debounced interrupt-driven button handling.
 - **`rgb_led`**: RMT-based driver for WS2812 (NeoPixel) and similar addressable LEDs.
 
+### 5. Smart LED Strip Engine (`smart_led`)
+Effect-driven WS2812B strip controller with a non-blocking FreeRTOS render engine.
+- Composable effect system with base + overlay layering via the `IEffect` interface.
+- Built-in effects: `SolidColor`, `Breathe`, `RainbowCycle`, `Chase`, `Flash`.
+- Global brightness control applied at hardware write stage.
+- Thread-safe runtime effect swapping.
+
 ---
 
 ## 🚀 Ready-to-Run Examples
@@ -53,6 +60,7 @@ RAII-compliant wrapper for standard SD cards using the SPI bus.
 | 04 | `04_sd_card_basic` | `sd_card` | Text file read/write on SPI SD cards. |
 | 05 | `05_rgb_led` | `rgb_led` | WS2812 control via RMT peripheral. |
 | 06 | `06_sd_audio_player` | `sd_card` + `audio` | Streaming raw audio from SD to I2S. |
+| 07 | `07_smart_led` | `smart_led` | Effect engine demo with 5 WS2812B LEDs. |
 
 ---
 
