@@ -12,14 +12,16 @@ static constexpr const char* TAG = "AudioChannel";
 AudioChannel::AudioChannel()
     : _active(false),
       _loop_enabled(false),
+      _eof_reached(false),
       _file(nullptr),
       _wav_header{},
       _file_position(0),
       _ring_buffer{},
-      _write_index(0),
       _read_index(0),
       _target_volume(0),
-      _current_volume(0) {}
+      _current_volume(0),
+      _underrun_count(0),
+      _min_available_samples(RING_BUFFER_SAMPLES) {}
 
 AudioChannel::~AudioChannel() {
     release();
@@ -61,20 +63,25 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
 
     fseek(_file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
 
-    // Pre-fill the entire ring buffer
+    // Pre-fill the ring buffer (leave 1 slot empty to distinguish full from empty)
     int16_t temp[RING_BUFFER_SAMPLES];
-    size_t filled = readFromFile(temp, RING_BUFFER_SAMPLES);
+    size_t filled = readFromFile(temp, RING_BUFFER_SAMPLES - 1);
     for (size_t i = 0; i < filled; ++i) {
         _ring_buffer[i] = temp[i];
     }
-    _write_index = filled % RING_BUFFER_SAMPLES;
+    _write_index = filled;
     _read_index = 0;
 
     _active = true;
+    _eof_reached = false;
     return ESP_OK;
 }
 
 void AudioChannel::release() {
+    if (_active && !_file_path.empty()) {
+        ESP_LOGI(TAG, "Playback stopped: %s. Min buffer level: %zu/%zu, Underruns: %lu",
+                 _file_path.c_str(), _min_available_samples, RING_BUFFER_SAMPLES, static_cast<unsigned long>(_underrun_count));
+    }
     _active = false;
 
     if (_file) {
@@ -88,7 +95,10 @@ void AudioChannel::release() {
     _current_volume = 0;
     _target_volume.store(0);
     _loop_enabled = false;
+    _eof_reached = false;
     _file_path.clear();
+    _underrun_count = 0;
+    _min_available_samples = RING_BUFFER_SAMPLES;
     std::memset(_ring_buffer, 0, sizeof(_ring_buffer));
 }
 
@@ -97,8 +107,21 @@ int16_t AudioChannel::getNextSample() {
     if (!_active) return 0;
 
     if (_read_index == _write_index) {
-        // Buffer underrun — output silence but don't deactivate
-        ESP_LOGD(TAG, "Buffer underrun on: %s", _file_path.c_str());
+        if (_eof_reached) {
+            if (_active) {
+                ESP_LOGI(TAG, "Playback finished: %s. Min buffer level: %zu/%zu, Underruns: %lu",
+                         _file_path.c_str(), _min_available_samples, RING_BUFFER_SAMPLES, static_cast<unsigned long>(_underrun_count));
+                _active = false;
+            }
+            return 0;
+        }
+
+        // Buffer underrun — output silence but don't deactivate.
+        _underrun_count++;
+        // Rate-limit warning to once per second of continuous underruns to prevent UART starvation
+        if (_underrun_count % 44100 == 1) {
+            ESP_LOGW(TAG, "Buffer underrun on: %s (count: %lu)", _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
+        }
         return 0;
     }
 
@@ -153,6 +176,10 @@ esp_err_t AudioChannel::refillBuffer() {
     if (!_active || !_file) return ESP_ERR_NOT_FOUND;
 
     size_t available = availableSamples();
+    if (available < _min_available_samples) {
+        _min_available_samples = available;
+    }
+
     size_t free_space = RING_BUFFER_SAMPLES - 1 - available; // -1 to distinguish full from empty
 
     if (free_space == 0) return ESP_OK;
@@ -190,8 +217,8 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested) {
                 _file_position = 0;
                 bytes_remaining = _wav_header.data_size;
             } else {
-                // One-shot: mark as inactive when buffer drains
-                _active = false;
+                // One-shot: mark EOF so it deactivates when buffer completely drains
+                _eof_reached = true;
                 break;
             }
         }
