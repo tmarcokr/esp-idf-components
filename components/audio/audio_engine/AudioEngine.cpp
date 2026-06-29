@@ -67,6 +67,11 @@ static void mixer_task_func(void* param) {
             impl->pending_count = 0;
             xSemaphoreGive(impl->chan_mutex);
         }
+
+        // Notify the SD reader task that samples were consumed
+        if (impl->reader_task) {
+            xTaskNotifyGive(impl->reader_task);
+        }
     }
 
     ESP_LOGI(TAG, "Mixer task stopped.");
@@ -86,6 +91,9 @@ static void sd_reader_task_func(void* param) {
     ESP_LOGI(TAG, "SD reader task started.");
 
     while (impl->running) {
+        // Block until the mixer task notifies us, or a maximum of 10ms timeout
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
         for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
             AudioChannel* ch = impl->channels[i];
             if (ch && ch->isActive() && ch->needsRefill()) {
@@ -95,9 +103,6 @@ static void sd_reader_task_func(void* param) {
                 }
             }
         }
-
-        // Sleep for 1 tick between scan cycles to keep CPU usage low while remaining responsive.
-        vTaskDelay(1);
     }
 
     ESP_LOGI(TAG, "SD reader task stopped.");
@@ -166,7 +171,7 @@ esp_err_t AudioEngine::init() {
         .dout_pin       = _impl->config.dout_pin,
         .sample_rate    = _impl->config.sample_rate,
         .dma_frame_count = 256,
-        .dma_desc_count  = 2
+        .dma_desc_count  = 4
     };
     _impl->i2s = new I2sTransmitter(i2s_cfg);
     esp_err_t ret = _impl->i2s->init();
@@ -214,13 +219,20 @@ esp_err_t AudioEngine::start() {
 
     _impl->running = true;
 
-    BaseType_t result = xTaskCreate(
+#if CONFIG_IDF_TARGET_ESP32S3
+    constexpr int kAudioCore = 1;
+#else
+    constexpr int kAudioCore = tskNO_AFFINITY;
+#endif
+
+    BaseType_t result = xTaskCreatePinnedToCore(
         mixer_task_func,
         "audio_mixer",
         4096,
         _impl,
         10,     // Priority 10 (highest audio)
-        &_impl->mixer_task
+        &_impl->mixer_task,
+        kAudioCore
     );
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create mixer task.");
@@ -228,13 +240,14 @@ esp_err_t AudioEngine::start() {
         return ESP_ERR_NO_MEM;
     }
 
-    result = xTaskCreate(
+    result = xTaskCreatePinnedToCore(
         sd_reader_task_func,
         "audio_sd_reader",
         8192,
         _impl,
         3,      // Priority 3 (background I/O)
-        &_impl->reader_task
+        &_impl->reader_task,
+        kAudioCore
     );
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SD reader task.");

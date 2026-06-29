@@ -25,8 +25,8 @@ esp_err_t I2sTransmitter::init() {
              static_cast<unsigned long>(_config.sample_rate));
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 4; // Increased from 2 for better stability on C6
-    chan_cfg.dma_frame_num = 256; 
+    chan_cfg.dma_desc_num = _config.dma_desc_count;
+    chan_cfg.dma_frame_num = _config.dma_frame_count; 
     // Removed auto_clear: true to prevent DMA stall corner cases on ESP32-C6.
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &_tx_handle, nullptr);
@@ -52,8 +52,11 @@ esp_err_t I2sTransmitter::init() {
         },
     };
     
-    // Force PLL_160M on C6 to ensure stable clock generation
+    // Force PLL_160M on C6 to ensure stable clock generation.
+    // On S3, use the default clock source to preserve correct MCLK divider ratios.
+#if CONFIG_IDF_TARGET_ESP32C6
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_PLL_160M;
+#endif
 
     ret = i2s_channel_init_std_mode(_tx_handle, &std_cfg);
     if (ret != ESP_OK) {

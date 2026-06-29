@@ -46,19 +46,20 @@ uint16_t PolyphonicMixer::getOutputLevel() const {
 
 
 int16_t PolyphonicMixer::applySoftClipping(int32_t mixed) {
-    constexpr int32_t MAX_AMPLITUDE = 32767;
-    constexpr int32_t MIN_AMPLITUDE = -32768;
+    constexpr int32_t KNEE = 24576;    // 75% of 32767 — compression begins here
+    constexpr int32_t MAX  = 32767;
+    constexpr float LIMIT  = static_cast<float>(MAX - KNEE);
 
-    if (mixed > MAX_AMPLITUDE) {
-        // Hyperbolic tangent approximation: smooth compression above threshold
-        int32_t overflow = mixed - MAX_AMPLITUDE;
-        return static_cast<int16_t>(MAX_AMPLITUDE - (MAX_AMPLITUDE / (1 + overflow)));
+    if (mixed > KNEE) {
+        float over = static_cast<float>(mixed - KNEE);
+        float compressed = static_cast<float>(KNEE) + LIMIT * (over / (LIMIT + over));
+        return static_cast<int16_t>(compressed);
     }
-    if (mixed < MIN_AMPLITUDE) {
-        int32_t overflow = MIN_AMPLITUDE - mixed;
-        return static_cast<int16_t>(MIN_AMPLITUDE + (MAX_AMPLITUDE / (1 + overflow)));
+    if (mixed < -KNEE) {
+        float over = static_cast<float>(-mixed - KNEE);
+        float compressed = static_cast<float>(KNEE) + LIMIT * (over / (LIMIT + over));
+        return static_cast<int16_t>(-compressed);
     }
-
     return static_cast<int16_t>(mixed);
 }
 

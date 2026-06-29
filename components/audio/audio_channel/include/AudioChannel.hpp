@@ -132,6 +132,7 @@ private:
     // --- State ---
     bool _active;
     bool _loop_enabled;
+    bool _eof_reached;
     std::string _file_path;
 
     // --- File I/O ---
@@ -147,6 +148,8 @@ private:
     // --- Volume ---
     std::atomic<uint16_t> _target_volume;
     uint16_t _current_volume;
+    uint32_t _underrun_count;
+    size_t _min_available_samples;
 
     /**
      * @brief Parse and validate a WAV file header.
