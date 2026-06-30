@@ -1,7 +1,10 @@
 #include "sd_card.hpp"
 #include "esp_vfs_fat.h"
 #include "driver/sdspi_host.h"
+#include "soc/soc_caps.h"
+#if SOC_SDMMC_HOST_SUPPORTED
 #include "driver/sdmmc_host.h"
+#endif
 #include "esp_log.h"
 #include <cstdio>
 #include <sys/stat.h>
@@ -63,6 +66,7 @@ esp_err_t SdCard::init() {
         ret = esp_vfs_fat_sdspi_mount(_config.mount_point.c_str(), &host, &slot_config, &mount_config, &_card);
 
     } else {
+#if SOC_SDMMC_HOST_SUPPORTED
         ESP_LOGI(TAG, "Initializing SD over SDMMC mode...");
         sdmmc_host_t host = SDMMC_HOST_DEFAULT();
         host.max_freq_khz = SDMMC_FREQ_DEFAULT;
@@ -86,6 +90,10 @@ esp_err_t SdCard::init() {
         }
 
         ret = esp_vfs_fat_sdmmc_mount(_config.mount_point.c_str(), &host, &slot_config, &mount_config, &_card);
+#else
+        ESP_LOGE(TAG, "SDMMC mode is not supported on this hardware (e.g., ESP32-C6). Please use SPI mode.");
+        return ESP_ERR_NOT_SUPPORTED;
+#endif
     }
 
     if (ret == ESP_OK) {
