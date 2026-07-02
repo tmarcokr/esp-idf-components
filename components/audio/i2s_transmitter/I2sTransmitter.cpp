@@ -26,8 +26,9 @@ esp_err_t I2sTransmitter::init() {
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = _config.dma_desc_count;
-    chan_cfg.dma_frame_num = _config.dma_frame_count; 
-    // Removed auto_clear: true to prevent DMA stall corner cases on ESP32-C6.
+    chan_cfg.dma_frame_num = _config.dma_frame_count;
+    // Emit silence (not stale buffer contents) on DMA underrun to prevent buzz/loop artifacts.
+    chan_cfg.auto_clear = true;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &_tx_handle, nullptr);
     if (ret != ESP_OK) {

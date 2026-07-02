@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include <cstdint>
 #include <cstring>
 
 namespace Espressif::Wrappers::Audio {
@@ -24,6 +25,7 @@ struct AudioEngineImpl {
 
     TaskHandle_t mixer_task      = nullptr;
     TaskHandle_t reader_task     = nullptr;
+    TaskHandle_t mem_reader_task = nullptr;
     SemaphoreHandle_t chan_mutex  = nullptr;
     volatile bool running        = false;
 
@@ -68,7 +70,10 @@ static void mixer_task_func(void* param) {
             xSemaphoreGive(impl->chan_mutex);
         }
 
-        // Notify the SD reader task that samples were consumed
+        // Notify both reader tasks that samples were consumed
+        if (impl->mem_reader_task) {
+            xTaskNotifyGive(impl->mem_reader_task);
+        }
         if (impl->reader_task) {
             xTaskNotifyGive(impl->reader_task);
         }
@@ -79,11 +84,41 @@ static void mixer_task_func(void* param) {
 }
 
 /**
- * @brief SD reader task: runs at priority 3, on-demand.
+ * @brief PSRAM reader task: runs at priority 9 (just below the mixer).
  *
- * Scans all active channels and refills their ring buffers when
- * the watermark threshold is crossed. Sleeps between scan cycles
- * to avoid busy-waiting.
+ * Services only memory-backed channels under /mem. Their refills are memcpy from
+ * PSRAM — they never touch the SD/FATFS lock — so this task never blocks and
+ * always finishes a pass in microseconds. Running it above the SD reader
+ * guarantees PSRAM channels (hum, swings) are topped up even while the SD
+ * reader is stalled inside a slow blocking read on a different channel.
+ */
+static void mem_reader_task_func(void* param) {
+    auto* impl = static_cast<AudioEngineImpl*>(param);
+
+    ESP_LOGI(TAG, "PSRAM reader task started.");
+
+    while (impl->running) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+
+        for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
+            AudioChannel* ch = impl->channels[i];
+            if (ch && ch->isActive() && ch->isMemoryBacked() && ch->needsRefill()) {
+                static_cast<void>(ch->refillBuffer());
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "PSRAM reader task stopped.");
+    vTaskDelete(nullptr);
+}
+
+/**
+ * @brief SD reader task: runs at priority 6, on-demand.
+ *
+ * Each pass refills the most-starved channel first (lowest buffered level),
+ * then re-scans. This prevents a slow read on one channel from pushing another
+ * into underrun: whichever channel is closest to running dry gets serviced next.
+ * Sleeps (notify/timeout) between scans to avoid busy-waiting.
  */
 static void sd_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
@@ -94,13 +129,29 @@ static void sd_reader_task_func(void* param) {
         // Block until the mixer task notifies us, or a maximum of 10ms timeout
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
 
-        for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
-            AudioChannel* ch = impl->channels[i];
-            if (ch && ch->isActive() && ch->needsRefill()) {
-                esp_err_t ret = ch->refillBuffer();
-                if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
-                    ESP_LOGW(TAG, "Refill error on channel %d: %s", i, esp_err_to_name(ret));
+        // Refill starved channels, most-empty first, until none need it.
+        for (;;) {
+            AudioChannel* neediest = nullptr;
+            int8_t neediest_idx = -1;
+            size_t lowest_level = SIZE_MAX;
+
+            for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
+                AudioChannel* ch = impl->channels[i];
+                if (ch && ch->isActive() && !ch->isMemoryBacked() && ch->needsRefill()) {
+                    size_t level = ch->bufferedSamples();
+                    if (level < lowest_level) {
+                        lowest_level = level;
+                        neediest = ch;
+                        neediest_idx = static_cast<int8_t>(i);
+                    }
                 }
+            }
+
+            if (!neediest) break;
+
+            esp_err_t ret = neediest->refillBuffer();
+            if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
+                ESP_LOGW(TAG, "Refill error on channel %d: %s", neediest_idx, esp_err_to_name(ret));
             }
         }
     }
@@ -124,6 +175,9 @@ AudioEngine::~AudioEngine() {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     if (_impl->reader_task) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (_impl->mem_reader_task) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
@@ -245,12 +299,27 @@ esp_err_t AudioEngine::start() {
         "audio_sd_reader",
         8192,
         _impl,
-        3,      // Priority 3 (background I/O)
+        6,      // Priority 6 (below mixer=10, above app tasks) — keep SD refills timely
         &_impl->reader_task,
         kAudioCore
     );
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SD reader task.");
+        _impl->running = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    result = xTaskCreatePinnedToCore(
+        mem_reader_task_func,
+        "audio_mem_reader",
+        4096,
+        _impl,
+        9,      // Priority 9 (just below mixer=10, above SD reader=6)
+        &_impl->mem_reader_task,
+        kAudioCore
+    );
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create PSRAM reader task.");
         _impl->running = false;
         return ESP_ERR_NO_MEM;
     }

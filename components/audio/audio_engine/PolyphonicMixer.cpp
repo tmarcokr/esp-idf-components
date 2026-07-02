@@ -1,15 +1,33 @@
 #include "PolyphonicMixer.hpp"
 #include "AudioChannel.hpp"
+#include "esp_log.h"
 #include <algorithm>
 #include <cmath>
 
 namespace Espressif::Wrappers::Audio {
+
+static constexpr const char* TAG = "AudioCalib";
+
+namespace {
+// Map the UI Q14 volume (0..16384) onto the compressor's gain term. With the
+// unity-gain cap in DynamicRangeCompressor, this value doubles as the loudness
+// threshold: attenuation starts when the running average exceeds ~(value-100)^2.
+// 800 keeps quiet passages at unity and attenuates busy/loud passages, which
+// stops the constant clipping we measured with kyberphonic/greyscale fonts.
+// Raise toward ~1200 for more loudness (and more clipping risk); lower for more
+// headroom. Prefer the MAX98357A hardware GAIN strap for overall loudness.
+int32_t volumeToCompressorGain(uint16_t q14_volume) {
+    return (static_cast<int32_t>(q14_volume) * 800) / 16384;
+}
+} // namespace
 
 
 PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels)
     : _channels(channels),
       _max_channels(max_channels),
       _global_volume(MAX_VOLUME),
+      _compressor(volumeToCompressorGain(MAX_VOLUME)),
+      _dc_blocker(),
       _rms_accumulator(0),
       _rms_sample_count(0),
       _rms_level(0) {}
@@ -18,16 +36,48 @@ PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels)
 void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
     for (size_t frame = 0; frame < frame_count; ++frame) {
         int32_t mixed = 0;
+        uint8_t active = 0;
 
         for (uint8_t ch = 0; ch < _max_channels; ++ch) {
             if (_channels[ch] && _channels[ch]->isActive()) {
                 mixed += static_cast<int32_t>(_channels[ch]->getNextSample());
+                ++active;
             }
         }
 
-        mixed = (mixed * static_cast<int32_t>(_global_volume)) >> 14;
+        // --- CALIBRATION TELEMETRY: raw summed peak, BEFORE any DSP ---
+        int32_t raw_abs = mixed < 0 ? -mixed : mixed;
+        if (raw_abs > _calib_peak_in) _calib_peak_in = raw_abs;
+        if (active > _calib_max_active) _calib_max_active = active;
 
-        int16_t sample = applySoftClipping(mixed);
+        // Apply DC blocking filter and square-root-law compression.
+        // The master volume is integrated into the compressor gain term to avoid
+        // a separate post-mix scaling stage.
+        mixed = _dc_blocker.process(mixed);
+        int16_t sample = _compressor.process(mixed);
+
+        // --- CALIBRATION TELEMETRY: output peak + clip count, AFTER DSP ---
+        int32_t out_abs = sample < 0 ? -sample : sample;
+        if (out_abs > _calib_peak_out) _calib_peak_out = out_abs;
+        if (sample >= 32767 || sample <= -32768) ++_calib_clip_count;
+        ++_calib_total;
+
+        if (_calib_total >= 44100) {  // ~1 second window @ 44.1kHz
+            ESP_LOGI(TAG,
+                     "in_peak=%ld out_peak=%ld clip=%.3f%% vol_avg=%lu maxCh=%u vol=%ld",
+                     static_cast<long>(_calib_peak_in),
+                     static_cast<long>(_calib_peak_out),
+                     100.0 * static_cast<double>(_calib_clip_count) /
+                         static_cast<double>(_calib_total),
+                     static_cast<unsigned long>(_compressor.averageVolume()),
+                     _calib_max_active,
+                     static_cast<long>(_compressor.volume()));
+            _calib_peak_in = 0;
+            _calib_peak_out = 0;
+            _calib_clip_count = 0;
+            _calib_total = 0;
+            _calib_max_active = 0;
+        }
 
         output[frame] = sample;
 
@@ -38,29 +88,11 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
 
 void PolyphonicMixer::setGlobalVolume(uint16_t volume) {
     _global_volume = std::min(volume, MAX_VOLUME);
+    _compressor.setVolume(volumeToCompressorGain(_global_volume));
 }
 
 uint16_t PolyphonicMixer::getOutputLevel() const {
     return _rms_level;
-}
-
-
-int16_t PolyphonicMixer::applySoftClipping(int32_t mixed) {
-    constexpr int32_t KNEE = 24576;    // 75% of 32767 — compression begins here
-    constexpr int32_t MAX  = 32767;
-    constexpr float LIMIT  = static_cast<float>(MAX - KNEE);
-
-    if (mixed > KNEE) {
-        float over = static_cast<float>(mixed - KNEE);
-        float compressed = static_cast<float>(KNEE) + LIMIT * (over / (LIMIT + over));
-        return static_cast<int16_t>(compressed);
-    }
-    if (mixed < -KNEE) {
-        float over = static_cast<float>(-mixed - KNEE);
-        float compressed = static_cast<float>(KNEE) + LIMIT * (over / (LIMIT + over));
-        return static_cast<int16_t>(-compressed);
-    }
-    return static_cast<int16_t>(mixed);
 }
 
 

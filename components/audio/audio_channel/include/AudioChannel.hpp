@@ -14,7 +14,7 @@ namespace Espressif::Wrappers::Audio {
  *
  * Each AudioChannel manages its own ring buffer filled from SD card by the reader task,
  * and provides sample-by-sample extraction for the mixer. Supports seamless looping
- * and anti-click volume ramping for SmoothSwing V2 compatibility.
+ * and anti-click volume ramping for InertialSwing compatibility.
  *
  * Thread safety model:
  * - `getNextSample()` / `isActive()` / `needsRefill()`: called from mixer task only
@@ -57,7 +57,7 @@ public:
      * @param path Full filesystem path (e.g., "/sdcard/hum.wav").
      * @param loop Enable seamless looping (wraps to data start on EOF).
      * @param initial_volume 14-bit volume (0–16384). Channels at volume 0
-     *        still advance playback position (SmoothSwing requirement).
+     *        still advance playback position (required for InertialSwing crossfading).
      * @return esp_err_t ESP_OK on success.
      */
     [[nodiscard]] esp_err_t load(std::string_view path, bool loop, uint16_t initial_volume);
@@ -110,6 +110,26 @@ public:
     bool needsRefill() const;
 
     /**
+     * @brief Number of unread samples currently buffered.
+     *
+     * Lets the SD reader service the most-starved channel first so a slow
+     * read on one channel can't push another into underrun. Safe to call
+     * from the reader task.
+     *
+     * @return Unread samples in the ring buffer (0..RING_BUFFER_SAMPLES-1).
+     */
+    size_t bufferedSamples() const { return availableSamples(); }
+
+    /**
+     * @brief True when the loaded file is served from the in-memory VFS (PSRAM).
+     *
+     * PSRAM-backed channels refill via memcpy and never block on the SD/FATFS
+     * lock, so the AudioEngine services them from a separate high-priority
+     * reader task to avoid head-of-line blocking behind slow SD reads.
+     */
+    bool isMemoryBacked() const { return _memory_backed; }
+
+    /**
      * @brief Refill the ring buffer from the SD card file.
      *
      * Called by the SD reader task. Reads up to half the buffer capacity
@@ -120,11 +140,26 @@ public:
     [[nodiscard]] esp_err_t refillBuffer();
 
 private:
-    /// Ring buffer capacity in samples (2048 samples = 4KB @ 16-bit).
-    static constexpr size_t RING_BUFFER_SAMPLES = 2048;
+    /// Ring buffer capacity in samples (16384 samples = 32KB @ 16-bit, ~371ms).
+    /// Large slack absorbs SD-reader stalls on big files (magnetic profile).
+    /// Allocated in PSRAM (not internal RAM) — see constructor.
+    static constexpr size_t RING_BUFFER_SAMPLES = 16384;
 
     /// Watermark threshold: refill when available samples drop below this.
-    static constexpr size_t REFILL_WATERMARK = 1024;
+    static constexpr size_t REFILL_WATERMARK = 8192;
+
+    /// Max samples per single SD read (4096 = ~93ms). Caps how long one
+    /// refillBuffer() holds the FATFS lock so the SD reader yields frequently
+    /// and can interleave other starved SD channels between chunks. Sized so
+    /// the reader can keep a long SD sound (e.g. a 2s retraction) topped up
+    /// even while sharing time with a concurrent blaster read.
+    static constexpr size_t MAX_SD_CHUNK_SAMPLES = 4096;
+
+    /// Initial samples pre-loaded for SD-backed files at load() time (~93ms).
+    /// Kept small so triggering a sound (e.g. a blaster block) holds the SD
+    /// lock only briefly; the reader task tops the ring up afterwards.
+    /// Memory-backed files ignore this and pre-fill the whole ring (memcpy).
+    static constexpr size_t INITIAL_PREFILL_SAMPLES = 4096;
 
     /// Volume precision: 14-bit (0–16384).
     static constexpr uint16_t MAX_VOLUME = 16384;
@@ -132,6 +167,7 @@ private:
     // --- State ---
     bool _active;
     bool _loop_enabled;
+    bool _memory_backed;
     bool _eof_reached;
     std::string _file_path;
 
@@ -140,8 +176,8 @@ private:
     WavHeader _wav_header;
     uint32_t _file_position;        ///< Current read position in data section (bytes)
 
-    // --- Ring Buffer ---
-    int16_t _ring_buffer[RING_BUFFER_SAMPLES];
+    // --- Ring Buffer (allocated in PSRAM) ---
+    int16_t* _ring_buffer;          ///< PSRAM-backed, RING_BUFFER_SAMPLES capacity
     volatile size_t _write_index;   ///< Next write position (SD reader task)
     volatile size_t _read_index;    ///< Next read position (mixer task)
 

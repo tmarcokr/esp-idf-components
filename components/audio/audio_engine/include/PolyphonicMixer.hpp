@@ -3,6 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "DynamicRangeCompressor.hpp"
+#include "DcBlocker.hpp"
+
 namespace Espressif::Wrappers::Audio {
 
 // Forward declaration
@@ -65,6 +68,16 @@ private:
     uint8_t _max_channels;
     uint16_t _global_volume;
 
+    DynamicRangeCompressor _compressor;
+    DcBlocker _dc_blocker;
+
+    // Calibration telemetry (temporary — remove once audio is tuned).
+    int32_t _calib_peak_in = 0;
+    int32_t _calib_peak_out = 0;
+    uint32_t _calib_clip_count = 0;
+    uint32_t _calib_total = 0;
+    uint8_t _calib_max_active = 0;
+
     /// Window size for RMS calculation (~100ms @ 44.1kHz)
     static constexpr size_t RMS_WINDOW_SAMPLES = 4410;
     uint64_t _rms_accumulator;      ///< Running sum of squared samples
@@ -72,17 +85,6 @@ private:
     uint16_t _rms_level;            ///< Last computed RMS level (0–16384)
 
     static constexpr uint16_t MAX_VOLUME = 16384;
-
-    /**
-     * @brief Apply soft-clipping to prevent harsh digital distortion.
-     *
-     * Uses a hyperbolic tangent approximation for smooth gain reduction
-     * near the clipping threshold, preserving audio dynamics.
-     *
-     * @param mixed 32-bit accumulated sample (may exceed int16 range).
-     * @return Clipped 16-bit sample within [-32768, 32767].
-     */
-    static int16_t applySoftClipping(int32_t mixed);
 
     /**
      * @brief Update the running RMS tracker with a new output sample.

@@ -1,5 +1,6 @@
 #include "AudioChannel.hpp"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -12,19 +13,31 @@ static constexpr const char* TAG = "AudioChannel";
 AudioChannel::AudioChannel()
     : _active(false),
       _loop_enabled(false),
+      _memory_backed(false),
       _eof_reached(false),
       _file(nullptr),
       _wav_header{},
       _file_position(0),
-      _ring_buffer{},
+      _ring_buffer(static_cast<int16_t*>(
+          heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM))),
+      _write_index(0),
       _read_index(0),
       _target_volume(0),
       _current_volume(0),
       _underrun_count(0),
-      _min_available_samples(RING_BUFFER_SAMPLES) {}
+      _min_available_samples(RING_BUFFER_SAMPLES) {
+    if (!_ring_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate %zu-sample ring buffer in PSRAM.",
+                 RING_BUFFER_SAMPLES);
+    }
+}
 
 AudioChannel::~AudioChannel() {
     release();
+    if (_ring_buffer) {
+        heap_caps_free(_ring_buffer);
+        _ring_buffer = nullptr;
+    }
 }
 
 
@@ -32,6 +45,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     release();
 
     _file_path = std::string(path);
+    _memory_backed = (_file_path.rfind("/mem/", 0) == 0);
 
     _file = fopen(_file_path.c_str(), "rb");
     if (!_file) {
@@ -63,12 +77,15 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
 
     fseek(_file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
 
-    // Pre-fill the ring buffer (leave 1 slot empty to distinguish full from empty)
-    int16_t temp[RING_BUFFER_SAMPLES];
-    size_t filled = readFromFile(temp, RING_BUFFER_SAMPLES - 1);
-    for (size_t i = 0; i < filled; ++i) {
-        _ring_buffer[i] = temp[i];
-    }
+    // Pre-fill the ring buffer (leave 1 slot empty to distinguish full from empty).
+    // Reads start at index 0 and never exceed capacity, so this is contiguous —
+    // read straight into the ring, no temp buffer / no wrap handling needed here.
+    // Memory-backed files fill the whole ring instantly (memcpy from PSRAM);
+    // SD-backed files pre-fill only a small slice so triggering a sound holds
+    // the SD lock briefly, then the reader task tops the ring up.
+    size_t prefill_target = _memory_backed ? (RING_BUFFER_SAMPLES - 1)
+                                           : INITIAL_PREFILL_SAMPLES;
+    size_t filled = readFromFile(_ring_buffer, prefill_target);
     _write_index = filled;
     _read_index = 0;
 
@@ -95,11 +112,14 @@ void AudioChannel::release() {
     _current_volume = 0;
     _target_volume.store(0);
     _loop_enabled = false;
+    _memory_backed = false;
     _eof_reached = false;
     _file_path.clear();
     _underrun_count = 0;
     _min_available_samples = RING_BUFFER_SAMPLES;
-    std::memset(_ring_buffer, 0, sizeof(_ring_buffer));
+    if (_ring_buffer) {
+        std::memset(_ring_buffer, 0, RING_BUFFER_SAMPLES * sizeof(int16_t));
+    }
 }
 
 
@@ -184,18 +204,24 @@ esp_err_t AudioChannel::refillBuffer() {
 
     if (free_space == 0) return ESP_OK;
 
-    size_t to_read = std::min(free_space, REFILL_WATERMARK);
-    int16_t temp[RING_BUFFER_SAMPLES];
-    size_t samples_read = readFromFile(temp, to_read);
+    size_t to_read = std::min({free_space, REFILL_WATERMARK, MAX_SD_CHUNK_SAMPLES});
 
-    if (samples_read == 0 && !_loop_enabled) {
-        // One-shot channel reached EOF — will be deactivated when buffer drains
-        return ESP_OK;
+    // Read directly into the ring buffer at _write_index. Split into up to two
+    // contiguous reads when the target region wraps past the end of the buffer.
+    size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - _write_index);
+    size_t first = readFromFile(_ring_buffer + _write_index, contiguous);
+    _write_index = (_write_index + first) % RING_BUFFER_SAMPLES;
+
+    size_t total_read = first;
+    if (first == contiguous && to_read > contiguous) {
+        size_t second = readFromFile(_ring_buffer + _write_index, to_read - contiguous);
+        _write_index = (_write_index + second) % RING_BUFFER_SAMPLES;
+        total_read += second;
     }
 
-    for (size_t i = 0; i < samples_read; ++i) {
-        _ring_buffer[_write_index] = temp[i];
-        _write_index = (_write_index + 1) % RING_BUFFER_SAMPLES;
+    if (total_read == 0 && !_loop_enabled) {
+        // One-shot channel reached EOF — will be deactivated when buffer drains
+        return ESP_OK;
     }
 
     return ESP_OK;
@@ -300,6 +326,12 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
             }
             if (header.bits_per_sample != 16) {
                 ESP_LOGE(TAG, "Unsupported bit depth: %u (expected 16)", header.bits_per_sample);
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            if (header.sample_rate != 44100) {
+                ESP_LOGE(TAG, "Unsupported sample rate: %luHz (expected 44100). "
+                              "Re-export this WAV at 44.1kHz mono 16-bit.",
+                         static_cast<unsigned long>(header.sample_rate));
                 return ESP_ERR_NOT_SUPPORTED;
             }
 
