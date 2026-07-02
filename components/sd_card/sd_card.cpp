@@ -1,6 +1,10 @@
 #include "sd_card.hpp"
 #include "esp_vfs_fat.h"
 #include "driver/sdspi_host.h"
+#include "soc/soc_caps.h"
+#if SOC_SDMMC_HOST_SUPPORTED
+#include "driver/sdmmc_host.h"
+#endif
 #include "esp_log.h"
 #include <cstdio>
 #include <sys/stat.h>
@@ -20,44 +24,77 @@ SdCard::~SdCard() {
 esp_err_t SdCard::init() {
     if (_mounted) return ESP_OK;
 
-    ESP_LOGI(TAG, "Initializing SPI bus for SD (Optimal Mode)...");
-
-    gpio_set_pull_mode(_config.miso, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(_config.mosi, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(_config.cs, GPIO_PULLUP_ONLY);
-
-    spi_bus_config_t bus_cfg = {};
-    bus_cfg.mosi_io_num = _config.mosi;
-    bus_cfg.miso_io_num = _config.miso;
-    bus_cfg.sclk_io_num = _config.sck;
-    bus_cfg.quadwp_io_num = -1;
-    bus_cfg.quadhd_io_num = -1;
-    bus_cfg.max_transfer_sz = 4000;
-
-    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    _spi_initialized = true;
-
+    esp_err_t ret = ESP_OK;
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
     mount_config.format_if_mount_failed = _config.format_if_mount_failed;
     mount_config.max_files = _config.max_files;
     mount_config.allocation_unit_size = 16 * 1024;
 
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-    host.max_freq_khz = 20000;
-
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = _config.cs;
-    slot_config.host_id = SPI2_HOST;
-    slot_config.gpio_cd = SDSPI_SLOT_NO_CD; 
-    slot_config.gpio_wp = SDSPI_SLOT_NO_WP; 
-
     ESP_LOGI(TAG, "Mounting filesystem at %s", _config.mount_point.c_str());
-    ret = esp_vfs_fat_sdspi_mount(_config.mount_point.c_str(), &host, &slot_config, &mount_config, &_card);
+
+    if (_config.mode == HostMode::SPI) {
+        ESP_LOGI(TAG, "Initializing SD over SPI mode...");
+        if (_config.miso != GPIO_NUM_NC) gpio_set_pull_mode(_config.miso, GPIO_PULLUP_ONLY);
+        if (_config.mosi != GPIO_NUM_NC) gpio_set_pull_mode(_config.mosi, GPIO_PULLUP_ONLY);
+        if (_config.cs != GPIO_NUM_NC) gpio_set_pull_mode(_config.cs, GPIO_PULLUP_ONLY);
+
+        spi_bus_config_t bus_cfg = {};
+        bus_cfg.mosi_io_num = _config.mosi;
+        bus_cfg.miso_io_num = _config.miso;
+        bus_cfg.sclk_io_num = _config.sck;
+        bus_cfg.quadwp_io_num = -1;
+        bus_cfg.quadhd_io_num = -1;
+        bus_cfg.max_transfer_sz = 4000;
+
+        ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        _spi_initialized = true;
+
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        host.slot = SPI2_HOST;
+        host.max_freq_khz = 20000;
+
+        sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+        slot_config.gpio_cs = _config.cs;
+        slot_config.host_id = SPI2_HOST;
+        slot_config.gpio_cd = SDSPI_SLOT_NO_CD; 
+        slot_config.gpio_wp = SDSPI_SLOT_NO_WP; 
+
+        ret = esp_vfs_fat_sdspi_mount(_config.mount_point.c_str(), &host, &slot_config, &mount_config, &_card);
+
+    } else {
+#if SOC_SDMMC_HOST_SUPPORTED
+        ESP_LOGI(TAG, "Initializing SD over SDMMC mode...");
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+        
+        if (_config.mode == HostMode::SDMMC_1BIT) {
+            host.flags = SDMMC_HOST_FLAG_1BIT;
+        } else {
+            host.flags = SDMMC_HOST_FLAG_4BIT;
+        }
+
+        sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot_config.width = (_config.mode == HostMode::SDMMC_1BIT) ? 1 : 4;
+        slot_config.clk = _config.clk;
+        slot_config.cmd = _config.cmd;
+        slot_config.d0 = _config.d0;
+        
+        if (_config.mode == HostMode::SDMMC_4BIT) {
+            slot_config.d1 = _config.d1;
+            slot_config.d2 = _config.d2;
+            slot_config.d3 = _config.d3;
+        }
+
+        ret = esp_vfs_fat_sdmmc_mount(_config.mount_point.c_str(), &host, &slot_config, &mount_config, &_card);
+#else
+        ESP_LOGE(TAG, "SDMMC mode is not supported on this hardware (e.g., ESP32-C6). Please use SPI mode.");
+        return ESP_ERR_NOT_SUPPORTED;
+#endif
+    }
 
     if (ret == ESP_OK) {
         _mounted = true;
@@ -82,7 +119,8 @@ esp_err_t SdCard::deinit() {
         }
     }
     
-    if (_spi_initialized) {
+    // SPI specific teardown
+    if (_spi_initialized && _config.mode == HostMode::SPI) {
         esp_err_t spi_ret = spi_bus_free(SPI2_HOST);
         if (spi_ret == ESP_OK) {
             _spi_initialized = false;

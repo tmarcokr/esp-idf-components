@@ -13,16 +13,37 @@ namespace Espressif::Wrappers {
 class SdCard {
 public:
     /**
-     * @brief Configuration for the SD card SPI interface.
+     * @brief Host mode for the SD Card.
+     */
+    enum class HostMode {
+        SPI,
+        SDMMC_1BIT,
+        SDMMC_4BIT
+    };
+
+    /**
+     * @brief Configuration for the SD card interface.
      */
     struct Config {
-        gpio_num_t miso;                ///< I2C MISO pin
-        gpio_num_t mosi;                ///< I2C MOSI pin
-        gpio_num_t sck;                 ///< I2C SCK pin
-        gpio_num_t cs;                  ///< SD CS pin
+        HostMode mode = HostMode::SPI;  ///< Hardware interface mode
+
+        // SPI pins (used if mode == SPI)
+        gpio_num_t miso = GPIO_NUM_NC;  ///< SPI MISO pin
+        gpio_num_t mosi = GPIO_NUM_NC;  ///< SPI MOSI pin
+        gpio_num_t sck = GPIO_NUM_NC;   ///< SPI SCK pin
+        gpio_num_t cs = GPIO_NUM_NC;    ///< SPI CS pin
+
+        // SDMMC pins (used if mode == SDMMC_1BIT or SDMMC_4BIT)
+        gpio_num_t clk = GPIO_NUM_NC;   ///< SDMMC CLK pin
+        gpio_num_t cmd = GPIO_NUM_NC;   ///< SDMMC CMD pin
+        gpio_num_t d0 = GPIO_NUM_NC;    ///< SDMMC D0 pin
+        gpio_num_t d1 = GPIO_NUM_NC;    ///< SDMMC D1 pin (4-bit only)
+        gpio_num_t d2 = GPIO_NUM_NC;    ///< SDMMC D2 pin (4-bit only)
+        gpio_num_t d3 = GPIO_NUM_NC;    ///< SDMMC D3 pin (4-bit only)
+
         std::string mount_point;        ///< VFS mount point (e.g. "/sdcard")
-        int max_files;                  ///< Max simultaneous open files
-        bool format_if_mount_failed;    ///< Auto-format flag
+        int max_files = 5;              ///< Max simultaneous open files
+        bool format_if_mount_failed = false; ///< Auto-format flag
     };
 
     /**
