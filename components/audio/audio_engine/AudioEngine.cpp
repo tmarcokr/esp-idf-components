@@ -89,7 +89,7 @@ static void mixer_task_func(void* param) {
  * Services only memory-backed channels under /mem. Their refills are memcpy from
  * PSRAM — they never touch the SD/FATFS lock — so this task never blocks and
  * always finishes a pass in microseconds. Running it above the SD reader
- * guarantees PSRAM channels (hum, swings) are topped up even while the SD
+ * guarantees PSRAM channels (e.g., looping background tracks) are topped up even while the SD
  * reader is stalled inside a slow blocking read on a different channel.
  */
 static void mem_reader_task_func(void* param) {

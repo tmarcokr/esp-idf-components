@@ -54,7 +54,7 @@ public:
      * Opens the file, parses and validates the WAV header, fills the initial
      * ring buffer, and sets the channel to active state.
      *
-     * @param path Full filesystem path (e.g., "/sdcard/hum.wav").
+     * @param path Full filesystem path (e.g., "/sdcard/track.wav").
      * @param loop Enable seamless looping (wraps to data start on EOF).
      * @param initial_volume 14-bit volume (0–16384). Channels at volume 0
      *        still advance playback position (required for dynamic crossfading).
@@ -152,11 +152,11 @@ private:
     /// refillBuffer() holds the FATFS lock so the SD reader yields frequently
     /// and can interleave other starved SD channels between chunks. Sized so
     /// the reader can keep a long SD sound (e.g. a 2s retraction) topped up
-    /// even while sharing time with a concurrent blaster read.
+    /// even while sharing time with a concurrent heavy read.
     static constexpr size_t MAX_SD_CHUNK_SAMPLES = 4096;
 
     /// Initial samples pre-loaded for SD-backed files at load() time (~93ms).
-    /// Kept small so triggering a sound (e.g. a blaster block) holds the SD
+    /// Kept small so triggering a sound (e.g., a sudden loud effect) holds the SD
     /// lock only briefly; the reader task tops the ring up afterwards.
     /// Memory-backed files ignore this and pre-fill the whole ring (memcpy).
     static constexpr size_t INITIAL_PREFILL_SAMPLES = 4096;
