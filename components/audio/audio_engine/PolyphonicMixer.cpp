@@ -13,9 +13,9 @@ namespace {
 // unity-gain cap in DynamicRangeCompressor, this value doubles as the loudness
 // threshold: attenuation starts when the running average exceeds ~(value-100)^2.
 // 800 keeps quiet passages at unity and attenuates busy/loud passages, which
-// stops the constant clipping we measured with kyberphonic/greyscale fonts.
+// prevents constant clipping when mixing heavily-mastered audio files.
 // Raise toward ~1200 for more loudness (and more clipping risk); lower for more
-// headroom. Prefer the MAX98357A hardware GAIN strap for overall loudness.
+// headroom. Prefer the hardware amplifier GAIN strap for overall loudness.
 int32_t volumeToCompressorGain(uint16_t q14_volume) {
     return (static_cast<int32_t>(q14_volume) * 800) / 16384;
 }

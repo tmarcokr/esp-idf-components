@@ -14,7 +14,7 @@ namespace Espressif::Wrappers::Audio {
  *
  * Each AudioChannel manages its own ring buffer filled from SD card by the reader task,
  * and provides sample-by-sample extraction for the mixer. Supports seamless looping
- * and anti-click volume ramping for InertialSwing compatibility.
+ * and anti-click volume ramping for dynamic crossfading compatibility.
  *
  * Thread safety model:
  * - `getNextSample()` / `isActive()` / `needsRefill()`: called from mixer task only
@@ -57,7 +57,7 @@ public:
      * @param path Full filesystem path (e.g., "/sdcard/hum.wav").
      * @param loop Enable seamless looping (wraps to data start on EOF).
      * @param initial_volume 14-bit volume (0–16384). Channels at volume 0
-     *        still advance playback position (required for InertialSwing crossfading).
+     *        still advance playback position (required for dynamic crossfading).
      * @return esp_err_t ESP_OK on success.
      */
     [[nodiscard]] esp_err_t load(std::string_view path, bool loop, uint16_t initial_volume);
