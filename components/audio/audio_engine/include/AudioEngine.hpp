@@ -37,8 +37,8 @@ constexpr ChannelId INVALID_CHANNEL = -1;
  *   AudioEngine engine(cfg);
  *   ESP_ERROR_CHECK(engine.init());
  *   ESP_ERROR_CHECK(engine.start());
- *   ChannelId hum = engine.play("/sdcard/hum.wav", true, 10000);
- *   engine.setChannelVolume(hum, 8000);
+ *   ChannelId bg_track = engine.play("/sdcard/bg_track.wav", true, 10000);
+ *   engine.setChannelVolume(bg_track, 8000);
  * @endcode
  */
 class AudioEngine {
@@ -95,9 +95,9 @@ public:
      * Loads the WAV file, allocates a channel, and begins sample extraction.
      * Thread-safe (mutex-protected).
      *
-     * @param file_path SD card path (e.g., "/sdcard/hum.wav").
-     * @param loop Seamless looping flag (required for hum/swing channels).
-     * @param initial_volume 14-bit volume (0–16384). Use 0 for SmoothSwing
+     * @param file_path SD card path (e.g., "/sdcard/track.wav").
+     * @param loop Seamless looping flag (required for background/drone channels).
+     * @param initial_volume 14-bit volume (0–16384). Use 0 for crossfaded
      *        channels that need phase-aligned silent startup.
      * @return Channel ID (>= 0) on success, INVALID_CHANNEL on failure.
      */
