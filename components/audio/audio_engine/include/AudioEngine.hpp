@@ -4,6 +4,7 @@
 #include "hal/gpio_types.h" // IWYU pragma: keep
 #include <cstdint>
 #include <string_view>
+#include "DcBlocker.hpp"
 
 namespace Espressif::Wrappers::Audio {
 
@@ -53,6 +54,8 @@ public:
         gpio_num_t sd_mode_pin  = GPIO_NUM_NC;  ///< MAX98357A SD_MODE pin for anti-pop
         uint32_t sample_rate    = 44100;        ///< Output sample rate (Hz)
         uint8_t max_channels    = 9;            ///< Maximum simultaneous channels
+        uint16_t compressor_gain_threshold = 800; ///< Dynamic range compressor baseline threshold
+        DcBlocker::CutoffPreset dc_cutoff = DcBlocker::CutoffPreset::Hz50; ///< High-pass filter cutoff
     };
 
     /**

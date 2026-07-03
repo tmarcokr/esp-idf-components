@@ -8,26 +8,18 @@ namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioCalib";
 
-namespace {
-// Map the UI Q14 volume (0..16384) onto the compressor's gain term. With the
-// unity-gain cap in DynamicRangeCompressor, this value doubles as the loudness
-// threshold: attenuation starts when the running average exceeds ~(value-100)^2.
-// 800 keeps quiet passages at unity and attenuates busy/loud passages, which
-// prevents constant clipping when mixing heavily-mastered audio files.
-// Raise toward ~1200 for more loudness (and more clipping risk); lower for more
-// headroom. Prefer the hardware amplifier GAIN strap for overall loudness.
-int32_t volumeToCompressorGain(uint16_t q14_volume) {
-    return (static_cast<int32_t>(q14_volume) * 800) / 16384;
+int32_t PolyphonicMixer::volumeToCompressorGain(uint16_t q14_volume) const {
+    return (static_cast<int32_t>(q14_volume) * _compressor_gain_threshold) / 16384;
 }
-} // namespace
 
 
-PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels)
+PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff)
     : _channels(channels),
       _max_channels(max_channels),
       _global_volume(MAX_VOLUME),
+      _compressor_gain_threshold(compressor_gain_threshold),
       _compressor(volumeToCompressorGain(MAX_VOLUME)),
-      _dc_blocker(),
+      _dc_blocker(dc_cutoff),
       _rms_accumulator(0),
       _rms_sample_count(0),
       _rms_level(0) {}

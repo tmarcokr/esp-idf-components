@@ -239,7 +239,7 @@ esp_err_t AudioEngine::init() {
         _impl->channels[i] = new AudioChannel();
     }
 
-    _impl->mixer = new PolyphonicMixer(_impl->channels, _impl->config.max_channels);
+    _impl->mixer = new PolyphonicMixer(_impl->channels, _impl->config.max_channels, _impl->config.compressor_gain_threshold, _impl->config.dc_cutoff);
 
     _impl->mix_buffer = new int16_t[_impl->i2s->getFrameCount()];
     std::memset(_impl->mix_buffer, 0, _impl->i2s->getFrameCount() * sizeof(int16_t));
