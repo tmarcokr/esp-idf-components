@@ -26,8 +26,10 @@ public:
      * @brief Construct a new Polyphonic Mixer.
      * @param channels Pointer to the array of AudioChannel pointers.
      * @param max_channels Maximum number of channels in the array.
+     * @param compressor_gain_threshold Baseline threshold for the dynamic range compressor.
+     * @param dc_cutoff High-pass filter cutoff preset for the DC Blocker.
      */
-    PolyphonicMixer(AudioChannel** channels, uint8_t max_channels);
+    PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff);
     ~PolyphonicMixer() = default;
 
     PolyphonicMixer(const PolyphonicMixer&) = delete;
@@ -67,6 +69,7 @@ private:
     AudioChannel** _channels;
     uint8_t _max_channels;
     uint16_t _global_volume;
+    uint16_t _compressor_gain_threshold;
 
     DynamicRangeCompressor _compressor;
     DcBlocker _dc_blocker;
@@ -85,6 +88,11 @@ private:
     uint16_t _rms_level;            ///< Last computed RMS level (0–16384)
 
     static constexpr uint16_t MAX_VOLUME = 16384;
+
+    /**
+     * @brief Compute the final compressor gain from the Q14 volume and the base threshold.
+     */
+    int32_t volumeToCompressorGain(uint16_t q14_volume) const;
 
     /**
      * @brief Update the running RMS tracker with a new output sample.
