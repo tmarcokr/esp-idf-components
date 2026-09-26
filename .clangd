@@ -1,3 +1,7 @@
+# Each example builds in its own `examples/<name>/build`: example sources find
+# their database by walking up from the file. Sources under `components/` are
+# shared by every example, so they use the root `build`, a symlink to the
+# example currently being worked on (`ln -sfn examples/<name>/build build`).
 CompileFlags:
   CompilationDatabase: "build"
 
@@ -6,12 +10,17 @@ CompileFlags:
 
   Remove: 
     - "-fno-shrink-wrap"
-    - "-fno-shrink-warp"
     - "-fstrict-volatile-bitfields"
     - "-fno-tree-switch-conversion"
     - "-march=*"
     - "-mabi=*"
+    - "-Wno-frame-address"
+    - "--param=*"
+    - "-fno-jump-tables"
+    - "-fno-optimize-sibling-calls"
     - "-mlongcalls"
+    - "-mlong-calls"
+    - "-mdisable-hardware-atomics"
 
 Index:
   Background: Build
@@ -20,3 +29,10 @@ Diagnostics:
   UnusedIncludes: None
   Suppress:
     - "unused-includes"
+
+---
+If:
+  PathMatch: examples/.*
+
+CompileFlags:
+  CompilationDatabase: Ancestors

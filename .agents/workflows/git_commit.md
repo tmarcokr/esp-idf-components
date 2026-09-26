@@ -10,9 +10,10 @@ Use this workflow to record your progress after completing a specific sub-task o
 
 1. **Pre-Commit Validation**:
    - Before committing, you MUST ensure the code is functional and does not break the project.
-   - Run the VS Code task **"Build ESP-IDF"** or execute the command equivalent:
+   - Build the affected example (from its `examples/<name>/` folder) with the ESP-IDF extension **Build** command or the command equivalent:
      ```bash
-     source ~/esp/esp-idf/export.sh && idf.py build
+     command -v idf.py >/dev/null || source ~/.espressif/tools/activate_idf_v6.1.sh
+     idf.py build
      ```
    - *Note:* If the project includes unit tests, they should also be executed and passed.
 

@@ -1,2 +1,3 @@
 ## IDF Component Manager Manifest File
-dependencies: {}
+dependencies:
+  idf: ">=5.3"

@@ -1,0 +1,16 @@
+{
+    "recommendations": [
+        "espressif.esp-idf-extension",
+        "eclipse-cdt.cdt-gdb-vscode",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "usernamehw.errorlens",
+        "twxs.cmake",
+        "bierner.markdown-mermaid",
+        "davidanson.vscode-markdownlint",
+        "github.vscode-github-actions"
+    ],
+    "unwantedRecommendations": [
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools-extension-pack"
+    ]
+}
