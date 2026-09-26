@@ -1,41 +1,34 @@
 {
+    // --- ESP-IDF extension -----------------------------------------------------
+    // Project-level only. Machine-specific paths (ESP-IDF, tools, Python env,
+    // serial port) belong in the user settings managed by the extension.
+    // This repository is a multi-example library: every example under
+    // `examples/` is a standalone ESP-IDF project with its own `build/`.
+    // Open the example folder (e.g. `code examples/07_smart_led`) to build,
+    // flash and debug it with the extension; the OpenOCD board config
+    // (`idf.openOcdConfigs`) is written by "ESP-IDF: Set Espressif Device
+    // Target", so it follows the selected chip (ESP32-S3 or ESP32-C6).
+
+    // --- clangd (esp-clang) ----------------------------------------------------
+    // `esp-clangd` is a stable symlink to the esp-clang clangd, created by the
+    // dotfiles ESP32 setup script (the real path carries the tool version).
+    // The compilation database is resolved per file by `.clangd`, not here.
+    "clangd.path": "${env:HOME}/.local/bin/esp-clangd",
     "clangd.arguments": [
-        "--compile-commands-dir=build",
-        "--query-driver=**/*g++",
+        "--query-driver=**/xtensa-esp*-elf-*,**/riscv32-esp*-elf-*",
         "--header-insertion=never"
     ],
-    "cmake.configureEnvironment": {
-        "IDF_PATH": "${env:HOME}/esp/esp-idf",
-        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/",
-        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts"
-    },
-    "cmake.buildEnvironment": {
-        "IDF_PATH": "${env:HOME}/esp/esp-idf",
-        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/",
-        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts"
-    },
-    "cmake.generator": "Ninja",
-    "cmake.configureOnOpen": true,
-    "cmake.configureArgs": [
-        "-DCMAKE_TOOLCHAIN_FILE=${env:HOME}/esp/esp-idf/tools/cmake/toolchain-esp32c6.cmake"
-    ],
-    "idf.espIdfPath": "${env:HOME}/esp/esp-idf",
-    "idf.customExtraPaths": "${env:HOME}/.espressif/tools/xtensa-esp-elf-gdb/14.2_20240403/xtensa-esp-elf-gdb/bin:${env:HOME}/.espressif/tools/riscv32-esp-elf-gdb/14.2_20240403/riscv32-esp-elf-gdb/bin:${env:HOME}/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin:${env:HOME}/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20241119/riscv32-esp-elf/bin:${env:HOME}/.espressif/tools/esp32-elf-rom-elf-debugger/20241016/esp32-elf-rom-elf-debugger/bin:${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/bin:${env:HOME}/.espressif/tools/esp-rom-elfs/20240305",
-    "idf.customExtraVars": {
-        "OPENOCD_SCRIPTS": "${env:HOME}/.espressif/tools/openocd-esp32/v0.12.0-esp32-20241016/openocd-esp32/share/openocd/scripts",
-        "IDF_CCACHE_ENABLE": "1",
-        "ESP_ROM_ELF_DIR": "${env:HOME}/.espressif/tools/esp-rom-elfs/20240305/"
-    },
-    "idf.pythonBinPath": "${env:HOME}/.espressif/python_env/idf5.4_py3.13_env/bin/python",
-    "idf.toolsPath": "${env:HOME}/.espressif",
-    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+    // clangd owns diagnostics and completion; keep Microsoft IntelliSense off
+    // in case cpptools gets installed as a dependency of another extension.
+    "C_Cpp.intelliSenseEngine": "disabled",
+
+    // --- Workspace ---------------------------------------------------------------
     "git.ignoredRepositories": [
-        "${env:HOME}/esp/esp-idf",
         "${workspaceFolder}/managed_components"
     ],
     "files.exclude": {
-        "managed_components": true,
-        "build": true
+        "**/managed_components": true,
+        "**/build": true
     },
     "files.autoSave": "afterDelay",
     "files.autoSaveDelay": 500,
@@ -43,6 +36,6 @@
     "diffEditor.useInlineViewWhenSpaceIsLimited": false,
     "editor.mouseWheelZoom": true,
     "workbench.editorAssociations": {
-    "*.md": "vscode.markdown.preview.editor"
-}
+        "*.md": "vscode.markdown.preview.editor"
+    }
 }

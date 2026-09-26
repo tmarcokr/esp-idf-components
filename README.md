@@ -1,6 +1,6 @@
 # ESP32 Hardware Drivers Collection (ESP-IDF)
 
-[![ESP-IDF Version](https://img.shields.io/badge/ESP--IDF-v5.x-blue)](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/)
+[![ESP-IDF Version](https://img.shields.io/badge/ESP--IDF-v5.3%2B%20%7C%20v6.x-blue)](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-orange)](https://en.cppreference.com/w/cpp/20)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -61,6 +61,14 @@ Effect-driven WS2812B strip controller with a non-blocking FreeRTOS render engin
 | 05 | `05_rgb_led` | `rgb_led` | WS2812 control via RMT peripheral. |
 | 06 | `06_sd_audio_player` | `sd_card` + `audio` | Streaming raw audio from SD to I2S. |
 | 07 | `07_smart_led` | `smart_led` | Effect engine demo with 5 WS2812B LEDs. |
+
+Each example is a standalone ESP-IDF project, built and verified in CI with ESP-IDF v6.1 for the ESP32-S3 and ESP32-C6 (the components require ESP-IDF v5.3 or newer). Build one from its folder with an activated ESP-IDF environment, or open that folder with the ESP-IDF VS Code extension:
+
+```bash
+cd examples/07_smart_led
+idf.py set-target esp32s3
+idf.py build
+```
 
 ---
 
