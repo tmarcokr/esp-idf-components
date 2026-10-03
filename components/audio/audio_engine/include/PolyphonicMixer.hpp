@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -24,6 +25,16 @@ class PolyphonicMixer {
 public:
     /// Maximum channels one mixer can handle (one bit per channel in a uint32_t mask).
     static constexpr uint8_t MAX_CHANNELS = 32;
+
+    /**
+     * @brief Mixer statistics returned by takeStats().
+     */
+    struct Stats {
+        uint32_t underruns;         ///< Underrun samples over all channels since construction.
+        int32_t peak_in;            ///< Max |sum| before DSP since the previous takeStats().
+        int32_t peak_out;           ///< Max |sample| after DSP since the previous takeStats().
+        uint32_t clipped_samples;   ///< Samples at full scale after DSP since the previous takeStats().
+    };
 
     /**
      * @brief Construct a new Polyphonic Mixer.
@@ -69,6 +80,15 @@ public:
      */
     uint16_t getOutputLevel() const;
 
+    /**
+     * @brief Lock-free snapshot of the mixer statistics; resets the peak and clip fields.
+     *
+     * Safe to call from any task while mixFrames() runs.
+     *
+     * @return The statistics accumulated since the previous call (underruns: since construction).
+     */
+    Stats takeStats();
+
 private:
     AudioChannel** _channels;
     uint8_t _max_channels;
@@ -78,12 +98,11 @@ private:
     DynamicRangeCompressor _compressor;
     DcBlocker _dc_blocker;
 
-    // Calibration telemetry (temporary — remove once audio is tuned).
-    int32_t _calib_peak_in = 0;
-    int32_t _calib_peak_out = 0;
-    uint32_t _calib_clip_count = 0;
-    uint32_t _calib_total = 0;
-    uint8_t _calib_max_active = 0;
+    // Relaxed is enough: no other data is published or read through these counters.
+    std::atomic<uint32_t> _underruns{0};
+    std::atomic<int32_t> _peak_in{0};
+    std::atomic<int32_t> _peak_out{0};
+    std::atomic<uint32_t> _clipped_samples{0};
 
     /// Window size for RMS calculation (~100ms @ 44.1kHz)
     static constexpr size_t RMS_WINDOW_SAMPLES = 4410;

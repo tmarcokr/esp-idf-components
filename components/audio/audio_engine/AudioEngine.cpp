@@ -31,6 +31,10 @@ struct AudioEngineImpl {
 
     /// Ready channels the mixer starts at the beginning of its next cycle (bit = channel).
     std::atomic<uint32_t> pending_start{0};
+
+    std::atomic<uint32_t> i2s_write_errors{0};
+    std::atomic<uint32_t> load_failures{0};
+    std::atomic<uint32_t> no_free_channels{0};
 };
 
 static void mixer_task_func(void* param) {
@@ -40,10 +44,12 @@ static void mixer_task_func(void* param) {
     ESP_LOGI(TAG, "Mixer task started (%lu frames/cycle).",
              static_cast<unsigned long>(frame_count));
 
+    uint32_t cycle = 0;
     while (impl->running) {
+        ++cycle;
         uint32_t starting = impl->pending_start.exchange(0, std::memory_order_acq_rel);
         for (; starting != 0; starting &= starting - 1) {
-            impl->channels[std::countr_zero(starting)]->start();
+            impl->channels[std::countr_zero(starting)]->start(cycle);
         }
 
         // Mix all active channels into the output buffer
@@ -52,7 +58,7 @@ static void mixer_task_func(void* param) {
         // Write to I2S DMA (blocks until DMA buffer available)
         esp_err_t ret = impl->i2s->write(impl->mix_buffer, frame_count);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "I2S write issue: %s", esp_err_to_name(ret));
+            impl->i2s_write_errors.fetch_add(1, std::memory_order_relaxed);
             vTaskDelay(pdMS_TO_TICKS(10)); // Prevent CPU spinlock on I2S stall
         }
 
@@ -343,6 +349,7 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
     }
 
     if (slot == INVALID_CHANNEL) {
+        _impl->no_free_channels.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGW(TAG, "No free channels available for: %.*s",
                  static_cast<int>(file_path.size()), file_path.data());
         return INVALID_CHANNEL;
@@ -350,6 +357,7 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
 
     esp_err_t ret = _impl->channels[slot]->load(file_path, loop, initial_volume);
     if (ret != ESP_OK) {
+        _impl->load_failures.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGE(TAG, "Failed to load: %.*s (err=%s)",
                  static_cast<int>(file_path.size()), file_path.data(),
                  esp_err_to_name(ret));
@@ -358,7 +366,7 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
 
     _impl->pending_start.fetch_or(1U << slot, std::memory_order_release);
 
-    ESP_LOGI(TAG, "Playing [ch%d]: %.*s (loop=%d, vol=%u)",
+    ESP_LOGD(TAG, "Playing [ch%d]: %.*s (loop=%d, vol=%u)",
              slot, static_cast<int>(file_path.size()), file_path.data(),
              loop, initial_volume);
     return slot;
@@ -369,7 +377,7 @@ void AudioEngine::stop(ChannelId id) {
 
     _impl->channels[id]->requestStop();
 
-    ESP_LOGI(TAG, "Stopping channel %d (fade-out scheduled).", id);
+    ESP_LOGD(TAG, "Stopping channel %d (fade-out scheduled).", id);
 }
 
 void AudioEngine::setChannelVolume(ChannelId id, uint16_t target_volume) {
@@ -388,6 +396,41 @@ void AudioEngine::setGlobalVolume(uint16_t target_volume) {
 uint16_t AudioEngine::getOutputLevel() const {
     if (!_impl || !_impl->mixer) return 0;
     return _impl->mixer->getOutputLevel();
+}
+
+AudioEngine::Stats AudioEngine::getStats() {
+    Stats stats;
+    if (!_impl || !_impl->channels || !_impl->mixer) return stats;
+
+    const PolyphonicMixer::Stats mix = _impl->mixer->takeStats();
+    stats.underruns = mix.underruns;
+    stats.peak_in = mix.peak_in;
+    stats.peak_out = mix.peak_out;
+    stats.clipped_samples = mix.clipped_samples;
+    stats.i2s_write_errors = _impl->i2s_write_errors.load(std::memory_order_relaxed);
+    stats.load_failures = _impl->load_failures.load(std::memory_order_relaxed);
+    stats.no_free_channels = _impl->no_free_channels.load(std::memory_order_relaxed);
+
+    for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
+        const AudioChannel* ch = _impl->channels[i];
+        if (!ch) continue;
+        stats.read_failures += ch->readFailures();
+        if (ch->state() != AudioChannel::State::Idle) ++stats.busy_channels;
+        if (ch->hasOpenFile()) ++stats.open_files;
+    }
+    return stats;
+}
+
+AudioEngine::ChannelInfo AudioEngine::channelInfo(ChannelId id) const {
+    ChannelInfo info;
+    if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return info;
+
+    const AudioChannel* ch = _impl->channels[id];
+    if (!ch) return info;
+    info.state = static_cast<uint8_t>(ch->state());
+    info.start_cycle = ch->startCycle();
+    info.underruns = ch->underruns();
+    return info;
 }
 
 } // namespace Espressif::Wrappers::Audio

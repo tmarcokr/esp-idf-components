@@ -100,15 +100,8 @@ esp_err_t I2sTransmitter::write(const int16_t* data, size_t frame_count) {
     const size_t bytes_to_write = frame_count * 2 * sizeof(int16_t);
     size_t bytes_written = 0;
 
-    esp_err_t ret = i2s_channel_write(_tx_handle, _stereo_buffer.data(), bytes_to_write,
-                                       &bytes_written, pdMS_TO_TICKS(WRITE_TIMEOUT_MS));
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "I2S write error: %s (wrote %zu/%zu bytes)",
-                 esp_err_to_name(ret), bytes_written, bytes_to_write);
-        return ret;
-    }
-
-    return ESP_OK;
+    return i2s_channel_write(_tx_handle, _stereo_buffer.data(), bytes_to_write,
+                             &bytes_written, pdMS_TO_TICKS(WRITE_TIMEOUT_MS));
 }
 
 } // namespace Espressif::Wrappers

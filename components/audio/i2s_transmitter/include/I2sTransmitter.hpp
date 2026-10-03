@@ -59,7 +59,8 @@ public:
      *
      * This call blocks until the DMA is ready to accept new data, making it
      * naturally paced by the I2S clock. The mixer task should call this in a
-     * loop to maintain continuous audio output.
+     * loop to maintain continuous audio output. Never logs: the caller decides how
+     * to report errors.
      *
      * @param data Pointer to 16-bit signed PCM samples (mono).
      * @param frame_count Number of frames to write.

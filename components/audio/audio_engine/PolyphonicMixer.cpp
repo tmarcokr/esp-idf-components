@@ -1,13 +1,17 @@
 #include "PolyphonicMixer.hpp"
 #include "AudioChannel.hpp"
-#include "esp_log.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
 
 namespace Espressif::Wrappers::Audio {
 
-static constexpr const char* TAG = "AudioCalib";
+static void publish_max(std::atomic<int32_t>& target, int32_t value) {
+    int32_t current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+    }
+}
 
 int32_t PolyphonicMixer::volumeToCompressorGain(uint16_t q14_volume) const {
     return (static_cast<int32_t>(q14_volume) * _compressor_gain_threshold) / 16384;
@@ -33,7 +37,10 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
             mixed_mask |= (1U << ch);
         }
     }
-    const auto active = static_cast<uint8_t>(std::popcount(mixed_mask));
+
+    int32_t peak_in = 0;
+    int32_t peak_out = 0;
+    uint32_t clipped = 0;
 
     for (size_t frame = 0; frame < frame_count; ++frame) {
         int32_t mixed = 0;
@@ -42,10 +49,7 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
             mixed += static_cast<int32_t>(_channels[std::countr_zero(pending)]->getNextSample());
         }
 
-        // --- CALIBRATION TELEMETRY: raw summed peak, BEFORE any DSP ---
-        int32_t raw_abs = mixed < 0 ? -mixed : mixed;
-        if (raw_abs > _calib_peak_in) _calib_peak_in = raw_abs;
-        if (active > _calib_max_active) _calib_max_active = active;
+        peak_in = std::max(peak_in, mixed < 0 ? -mixed : mixed);
 
         // Apply DC blocking filter and square-root-law compression.
         // The master volume is integrated into the compressor gain term to avoid
@@ -53,37 +57,33 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
         mixed = _dc_blocker.process(mixed);
         int16_t sample = _compressor.process(mixed);
 
-        // --- CALIBRATION TELEMETRY: output peak + clip count, AFTER DSP ---
-        int32_t out_abs = sample < 0 ? -sample : sample;
-        if (out_abs > _calib_peak_out) _calib_peak_out = out_abs;
-        if (sample >= 32767 || sample <= -32768) ++_calib_clip_count;
-        ++_calib_total;
-
-        if (_calib_total >= 44100) {  // ~1 second window @ 44.1kHz
-            ESP_LOGI(TAG,
-                     "in_peak=%ld out_peak=%ld clip=%.3f%% vol_avg=%lu maxCh=%u vol=%ld",
-                     static_cast<long>(_calib_peak_in),
-                     static_cast<long>(_calib_peak_out),
-                     100.0 * static_cast<double>(_calib_clip_count) /
-                         static_cast<double>(_calib_total),
-                     static_cast<unsigned long>(_compressor.averageVolume()),
-                     _calib_max_active,
-                     static_cast<long>(_compressor.volume()));
-            _calib_peak_in = 0;
-            _calib_peak_out = 0;
-            _calib_clip_count = 0;
-            _calib_total = 0;
-            _calib_max_active = 0;
-        }
+        const int32_t out_sample = sample;
+        peak_out = std::max(peak_out, out_sample < 0 ? -out_sample : out_sample);
+        if (sample >= 32767 || sample <= -32768) ++clipped;
 
         output[frame] = sample;
 
         updateRms(sample);
     }
 
+    uint32_t underruns = 0;
     for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
-        _channels[std::countr_zero(pending)]->endMixCycle();
+        underruns += _channels[std::countr_zero(pending)]->endMixCycle();
     }
+
+    publish_max(_peak_in, peak_in);
+    publish_max(_peak_out, peak_out);
+    if (clipped != 0) _clipped_samples.fetch_add(clipped, std::memory_order_relaxed);
+    if (underruns != 0) _underruns.fetch_add(underruns, std::memory_order_relaxed);
+}
+
+PolyphonicMixer::Stats PolyphonicMixer::takeStats() {
+    return Stats{
+        .underruns = _underruns.load(std::memory_order_relaxed),
+        .peak_in = _peak_in.exchange(0, std::memory_order_relaxed),
+        .peak_out = _peak_out.exchange(0, std::memory_order_relaxed),
+        .clipped_samples = _clipped_samples.exchange(0, std::memory_order_relaxed),
+    };
 }
 
 

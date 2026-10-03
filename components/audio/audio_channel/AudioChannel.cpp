@@ -19,20 +19,23 @@ AudioChannel::AudioChannel()
       _file(nullptr),
       _wav_header{},
       _file_position(0),
-      _min_available_samples(RING_BUFFER_SAMPLES),
       _ring_buffer(static_cast<int16_t*>(
           heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM))),
       _write_index(0),
       _read_index(0),
       _eof(false),
+      _file_open(false),
       _target_volume(0),
       _current_volume(0),
       _underrun_count(0),
+      _read_failures(0),
+      _start_cycle(0),
       _mix_state(State::Idle),
       _mix_eof(false),
       _mix_read(0),
       _mix_write(0),
-      _mix_target(0) {
+      _mix_target(0),
+      _mix_underruns(0) {
     if (!_ring_buffer) {
         ESP_LOGE(TAG, "Failed to allocate %zu-sample ring buffer in PSRAM.",
                  RING_BUFFER_SAMPLES);
@@ -90,6 +93,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
         abortLoad();
         return ESP_ERR_NOT_FOUND;
     }
+    _file_open.store(true, std::memory_order_release);
 
     esp_err_t ret = parseWavHeader(_file, _wav_header);
     if (ret != ESP_OK) {
@@ -109,7 +113,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Loaded: %s (%luHz, %u-bit, %u-ch, data: %lu bytes)",
+    ESP_LOGD(TAG, "Loaded: %s (%luHz, %u-bit, %u-ch, data: %lu bytes)",
              _file_path.c_str(),
              static_cast<unsigned long>(_wav_header.sample_rate),
              _wav_header.bits_per_sample,
@@ -118,8 +122,8 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
 
     _loop_enabled = loop;
     _file_position = 0;
-    _underrun_count = 0;
-    _min_available_samples = RING_BUFFER_SAMPLES;
+    _underrun_count.store(0, std::memory_order_relaxed);
+    _start_cycle.store(0, std::memory_order_relaxed);
     const uint16_t volume = std::min(initial_volume, MAX_VOLUME);
     _target_volume.store(volume);
     _current_volume = volume;
@@ -163,6 +167,7 @@ void AudioChannel::closeFile() {
     if (_file) {
         fclose(_file);
         _file = nullptr;
+        _file_open.store(false, std::memory_order_release);
     }
 }
 
@@ -173,8 +178,8 @@ void AudioChannel::release() {
     _loop_enabled = false;
     _file_position = 0;
     _wav_header = {};
-    _min_available_samples = RING_BUFFER_SAMPLES;
-    _underrun_count = 0;
+    _underrun_count.store(0, std::memory_order_relaxed);
+    _start_cycle.store(0, std::memory_order_relaxed);
     _current_volume = 0;
     _target_volume.store(0);
     _write_index.store(0, std::memory_order_release);
@@ -215,8 +220,10 @@ void AudioChannel::requestStop() {
 }
 
 
-bool AudioChannel::start() {
-    return transition(State::Ready, State::Active);
+bool AudioChannel::start(uint32_t cycle) {
+    if (!transition(State::Ready, State::Active)) return false;
+    _start_cycle.store(cycle, std::memory_order_relaxed);
+    return true;
 }
 
 bool AudioChannel::beginMixCycle() {
@@ -230,17 +237,14 @@ bool AudioChannel::beginMixCycle() {
     _mix_eof = _eof.load(std::memory_order_acquire);
     _mix_write = _write_index.load(std::memory_order_acquire);
     _mix_read = _read_index.load(std::memory_order_acquire);
+    _mix_underruns = 0;
     return true;
 }
 
 int16_t AudioChannel::getNextSample() {
     if (_mix_read == _mix_write) {
         if (!_mix_eof) {
-            _underrun_count++;
-            // Rate-limit warning to once per second of continuous underruns to prevent UART starvation
-            if (_underrun_count % 44100 == 1) {
-                ESP_LOGW(TAG, "Buffer underrun on: %s (count: %lu)", _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
-            }
+            ++_mix_underruns;
         }
         return 0;
     }
@@ -254,8 +258,11 @@ int16_t AudioChannel::getNextSample() {
     return static_cast<int16_t>(scaled);
 }
 
-void AudioChannel::endMixCycle() {
+uint32_t AudioChannel::endMixCycle() {
     _read_index.store(_mix_read, std::memory_order_release);
+    if (_mix_underruns != 0) {
+        _underrun_count.fetch_add(_mix_underruns, std::memory_order_relaxed);
+    }
 
     const bool drained = (_mix_read == _mix_write);
     if (_mix_state == State::Stopping) {
@@ -263,10 +270,9 @@ void AudioChannel::endMixCycle() {
             transition(State::Stopping, State::Closing);
         }
     } else if (_mix_eof && drained) {
-        ESP_LOGI(TAG, "Playback finished: %s. Underruns: %lu",
-                 _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
         transition(State::Active, State::Closing);
     }
+    return _mix_underruns;
 }
 
 void AudioChannel::setTargetVolume(uint16_t volume) {
@@ -300,6 +306,22 @@ void AudioChannel::updateVolumeRamp() {
 bool AudioChannel::isActive() const {
     const State current = state();
     return current == State::Ready || current == State::Active || current == State::Stopping;
+}
+
+uint32_t AudioChannel::underruns() const {
+    return _underrun_count.load(std::memory_order_relaxed);
+}
+
+uint32_t AudioChannel::readFailures() const {
+    return _read_failures.load(std::memory_order_relaxed);
+}
+
+uint32_t AudioChannel::startCycle() const {
+    return _start_cycle.load(std::memory_order_relaxed);
+}
+
+bool AudioChannel::hasOpenFile() const {
+    return _file_open.load(std::memory_order_acquire);
 }
 
 bool AudioChannel::isMemoryBacked() const {
@@ -340,9 +362,6 @@ size_t AudioChannel::refillBuffer() {
     size_t write = _write_index.load(std::memory_order_acquire);
     const size_t read = _read_index.load(std::memory_order_acquire);
     const size_t available = (write >= read) ? (write - read) : (RING_BUFFER_SAMPLES - read + write);
-    if (available < _min_available_samples) {
-        _min_available_samples = available;
-    }
 
     size_t free_space = RING_BUFFER_SAMPLES - 1 - available; // -1 to distinguish full from empty
 
@@ -408,7 +427,7 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool&
 
         size_t actually_read = fread(dest + total_read, sizeof(int16_t), to_read, file);
         if (actually_read == 0) {
-            ESP_LOGW(TAG, "Unexpected read failure on: %s", _file_path.c_str());
+            _read_failures.fetch_add(1, std::memory_order_relaxed);
             if (!_loop_enabled) {
                 eof = true;
             }

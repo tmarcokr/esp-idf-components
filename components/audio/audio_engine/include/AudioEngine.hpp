@@ -31,7 +31,8 @@ constexpr ChannelId INVALID_CHANNEL = -1;
  * - play() / stop(): lock-free; every channel has an atomic lifecycle and a single
  *   owner of its file at any time (the SD or PSRAM reader closes it, never the mixer)
  * - setChannelVolume() / setGlobalVolume(): lock-free (atomic writes)
- * - getOutputLevel(): lock-free read
+ * - getOutputLevel() / getStats() / channelInfo(): lock-free reads
+ * - The mixer and reader tasks never log; problems are counted (see getStats()).
  *
  * Usage (future — not integrated into main.cpp yet):
  * @code
@@ -148,6 +149,50 @@ public:
      * @return 0–16384 (0%–100% of maximum output).
      */
     uint16_t getOutputLevel() const;
+
+    /**
+     * @brief Engine counters returned by getStats().
+     */
+    struct Stats {
+        uint32_t underruns = 0;         ///< Underrun samples over all channels since start.
+        uint32_t group_holds = 0;       ///< Mixer cycles in which a linked group of channels was held.
+        uint32_t i2s_write_errors = 0;  ///< Failed I2S writes since start.
+        uint32_t load_failures = 0;     ///< play() calls whose file could not be loaded, since start.
+        uint32_t no_free_channels = 0;  ///< play() calls that found every channel busy, since start.
+        uint32_t read_failures = 0;     ///< File reads that returned no data before the end, since start.
+        uint8_t busy_channels = 0;      ///< Channels not Idle.
+        uint8_t open_files = 0;         ///< Channels holding an open file.
+        int32_t peak_in = 0;            ///< Max |sum| before DSP since the last call.
+        int32_t peak_out = 0;           ///< Max |sample| after DSP since the last call.
+        uint32_t clipped_samples = 0;   ///< Samples at full scale after DSP since the last call.
+    };
+
+    /**
+     * @brief Lock-free snapshot of engine counters; peak fields reset on each call.
+     *
+     * Callable from any task. Intended for a single periodic consumer, since each call
+     * resets peak_in, peak_out and clipped_samples.
+     *
+     * @return The counters; all zero before init().
+     */
+    Stats getStats();
+
+    /**
+     * @brief Per-channel snapshot for diagnostics and tests.
+     */
+    struct ChannelInfo {
+        uint8_t state = 0;          ///< 0 Idle, 1 Loading, 2 Ready, 3 Active, 4 Stopping, 5 Closing.
+        uint8_t group = 0;          ///< Linked group id; 0 when the channel is not linked.
+        uint32_t start_cycle = 0;   ///< Mixer cycle in which the current sound started; 0 if not started.
+        uint32_t underruns = 0;     ///< Underrun samples of the current sound.
+    };
+
+    /**
+     * @brief Lock-free snapshot of one channel; callable from any task.
+     * @param id Channel ID.
+     * @return The channel snapshot; all zero for an invalid id or before init().
+     */
+    ChannelInfo channelInfo(ChannelId id) const;
 
 private:
     friend struct AudioEngineImpl;

@@ -372,6 +372,13 @@ void logReport(const StressContext& ctx) {
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), stackFreeBytes("audio_mixer"),
              stackFreeBytes("audio_sd_reader"), stackFreeBytes("audio_mem_reader"));
+
+    const AudioEngine::Stats stats = ctx.engine.getStats();
+    ESP_LOGI(TAG,
+             "engine busy %u open %u | underruns %" PRIu32 " group_holds %" PRIu32 " i2s_err %" PRIu32
+             " load_fail %" PRIu32 " no_free %" PRIu32 " read_fail %" PRIu32 " | peak in %" PRId32 " out %" PRId32 " clipped %" PRIu32,
+             stats.busy_channels, stats.open_files, stats.underruns, stats.group_holds, stats.i2s_write_errors,
+             stats.load_failures, stats.no_free_channels, stats.read_failures, stats.peak_in, stats.peak_out, stats.clipped_samples);
 }
 
 void reportBody(StressContext& ctx) {

@@ -33,6 +33,7 @@ namespace Espressif::Wrappers::Audio {
  * - requestStop() / setTargetVolume(): any task, lock-free.
  * - start() / beginMixCycle() / getNextSample() / endMixCycle(): mixer task only.
  * - isOwnedBy() / needsRefill() / refillBuffer() / closeIfClosing(): reader tasks only.
+ * - state() / isActive() / underruns() / readFailures() / startCycle() / hasOpenFile(): any task.
  */
 class AudioChannel {
 public:
@@ -111,9 +112,10 @@ public:
 
     /**
      * @brief Mixer only: start a Ready channel (Ready → Active).
+     * @param cycle Mixer cycle counter value, reported by startCycle().
      * @return true if the channel became Active.
      */
-    bool start();
+    bool start(uint32_t cycle);
 
     /**
      * @brief Mixer only: snapshot the channel for one mixer cycle.
@@ -137,8 +139,10 @@ public:
      *
      * Moves a Stopping channel whose fade reached 0 (or whose buffer ran dry), and a
      * one-shot that played to its end, to Closing.
+     *
+     * @return Underrun samples (silence output while not at the end of the file) in this cycle.
      */
-    void endMixCycle();
+    uint32_t endMixCycle();
 
     /**
      * @brief Set the target volume for smooth ramping.
@@ -174,6 +178,32 @@ public:
     bool isMemoryBacked() const;
 
     /**
+     * @brief Underrun samples of the current sound (reset when a sound is loaded or closed).
+     * @return Samples output as silence because the ring buffer was empty before the end of the file.
+     */
+    uint32_t underruns() const;
+
+    /**
+     * @brief Failed or empty file reads since construction (never reset).
+     * @return Number of reads that returned no data before the end of the data section.
+     */
+    uint32_t readFailures() const;
+
+    /**
+     * @brief Mixer cycle in which the current sound was started.
+     * @return The cycle passed to start(), or 0 if the current sound has not started.
+     */
+    uint32_t startCycle() const;
+
+    /**
+     * @brief True while the channel holds an open file handle.
+     *
+     * Maintained by the task that owns the file, so it can be read from any task.
+     * A one-shot closes its file as soon as its last chunk is buffered.
+     */
+    bool hasOpenFile() const;
+
+    /**
      * @brief Reader only: check whether the given reader kind owns this channel.
      *
      * Once this returns true, the channel cannot become Idle (and so cannot be reused)
@@ -205,6 +235,7 @@ public:
      * @brief Reader only: refill the ring buffer from the file.
      *
      * Must be called only by the reader that owns the channel (see isOwnedBy()).
+     * Read failures are counted (see readFailures()), not logged.
      * Reads up to MAX_SD_CHUNK_SAMPLES from the current file position and handles
      * EOF looping internally. Stops early if the channel moves to Closing. When a
      * one-shot reaches the end of its data (or a read fails), the end is published
@@ -265,18 +296,23 @@ private:
     FILE* _file;
     WavHeader _wav_header;
     uint32_t _file_position;        ///< Current read position in data section (bytes)
-    size_t _min_available_samples;
 
     // --- Ring Buffer (allocated in PSRAM) ---
     int16_t* _ring_buffer;              ///< PSRAM-backed, RING_BUFFER_SAMPLES capacity
     std::atomic<size_t> _write_index;   ///< Next write position (owner; released after the samples)
     std::atomic<size_t> _read_index;    ///< Next read position (mixer; released after consuming)
     std::atomic<bool> _eof;             ///< One-shot fully buffered (released after _write_index)
+    std::atomic<bool> _file_open;       ///< Mirrors _file != nullptr (owner writes)
 
     // --- Volume ---
     std::atomic<uint16_t> _target_volume;
     uint16_t _current_volume;
-    uint32_t _underrun_count;
+
+    // --- Statistics ---
+    // Relaxed is enough: no other data is published or read through these counters.
+    std::atomic<uint32_t> _underrun_count;
+    std::atomic<uint32_t> _read_failures;
+    std::atomic<uint32_t> _start_cycle;
 
     // --- Mixer cycle snapshot (mixer task only) ---
     State _mix_state;
@@ -284,6 +320,7 @@ private:
     size_t _mix_read;
     size_t _mix_write;
     uint16_t _mix_target;
+    uint32_t _mix_underruns;
 
     static State stateOf(uint8_t status) { return static_cast<State>(status & STATE_MASK); }
 
