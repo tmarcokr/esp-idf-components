@@ -22,10 +22,13 @@ class AudioChannel;
  */
 class PolyphonicMixer {
 public:
+    /// Maximum channels one mixer can handle (one bit per channel in a uint32_t mask).
+    static constexpr uint8_t MAX_CHANNELS = 32;
+
     /**
      * @brief Construct a new Polyphonic Mixer.
      * @param channels Pointer to the array of AudioChannel pointers.
-     * @param max_channels Maximum number of channels in the array.
+     * @param max_channels Number of channels in the array (clamped to MAX_CHANNELS).
      * @param compressor_gain_threshold Baseline threshold for the dynamic range compressor.
      * @param dc_cutoff High-pass filter cutoff preset for the DC Blocker.
      */
@@ -36,9 +39,10 @@ public:
     PolyphonicMixer& operator=(const PolyphonicMixer&) = delete;
 
     /**
-     * @brief Mix all active channels into the output buffer.
+     * @brief Mix all Active and Stopping channels into the output buffer.
      *
-     * For each frame:
+     * Snapshots every channel once per call (beginMixCycle()), mixes the frames,
+     * then publishes the consumed samples (endMixCycle()). For each frame:
      * 1. Sum all active channel samples into a 32-bit accumulator
      * 2. Apply global volume scaling (14-bit fixed-point)
      * 3. Apply soft-clipping to prevent DAC overflow

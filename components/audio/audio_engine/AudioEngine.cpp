@@ -4,9 +4,10 @@
 #include "PolyphonicMixer.hpp"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 
@@ -26,13 +27,10 @@ struct AudioEngineImpl {
     TaskHandle_t mixer_task      = nullptr;
     TaskHandle_t reader_task     = nullptr;
     TaskHandle_t mem_reader_task = nullptr;
-    SemaphoreHandle_t chan_mutex  = nullptr;
     volatile bool running        = false;
 
-    /// Channels pending release after fade-out completes
-    static constexpr uint8_t MAX_PENDING = 16;
-    ChannelId pending_release[MAX_PENDING] = {};
-    uint8_t pending_count = 0;
+    /// Ready channels the mixer starts at the beginning of its next cycle (bit = channel).
+    std::atomic<uint32_t> pending_start{0};
 };
 
 static void mixer_task_func(void* param) {
@@ -43,6 +41,11 @@ static void mixer_task_func(void* param) {
              static_cast<unsigned long>(frame_count));
 
     while (impl->running) {
+        uint32_t starting = impl->pending_start.exchange(0, std::memory_order_acq_rel);
+        for (; starting != 0; starting &= starting - 1) {
+            impl->channels[std::countr_zero(starting)]->start();
+        }
+
         // Mix all active channels into the output buffer
         impl->mixer->mixFrames(impl->mix_buffer, frame_count);
 
@@ -53,24 +56,6 @@ static void mixer_task_func(void* param) {
             vTaskDelay(pdMS_TO_TICKS(10)); // Prevent CPU spinlock on I2S stall
         }
 
-        // Check for channels pending release (fade-out completed)
-        if (impl->pending_count > 0 && xSemaphoreTake(impl->chan_mutex, 0) == pdTRUE) {
-            for (uint8_t i = 0; i < impl->pending_count; ++i) {
-                ChannelId id = impl->pending_release[i];
-                if (id >= 0 && id < impl->config.max_channels) {
-                    AudioChannel* ch = impl->channels[id];
-                    if (ch) {
-                        // Check if volume has ramped down to near-zero
-                        // We simply release — the ramp already happened
-                        ch->release();
-                    }
-                }
-            }
-            impl->pending_count = 0;
-            xSemaphoreGive(impl->chan_mutex);
-        }
-
-        // Notify both reader tasks that samples were consumed
         if (impl->mem_reader_task) {
             xTaskNotifyGive(impl->mem_reader_task);
         }
@@ -83,6 +68,15 @@ static void mixer_task_func(void* param) {
     vTaskDelete(nullptr);
 }
 
+static void close_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
+    for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
+        AudioChannel* ch = impl->channels[i];
+        if (ch) {
+            ch->closeIfClosing(memory_reader);
+        }
+    }
+}
+
 /**
  * @brief PSRAM reader task: runs at priority 9 (just below the mixer).
  *
@@ -91,18 +85,22 @@ static void mixer_task_func(void* param) {
  * always finishes a pass in microseconds. Running it above the SD reader
  * guarantees PSRAM channels (e.g., looping background tracks) are topped up even while the SD
  * reader is stalled inside a slow blocking read on a different channel.
+ * It is the only task that closes and resets the memory-backed channels.
  */
 static void mem_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
+    constexpr bool kMemoryReader = true;
 
     ESP_LOGI(TAG, "PSRAM reader task started.");
 
     while (impl->running) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
 
+        close_owned_channels(impl, kMemoryReader);
+
         for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
             AudioChannel* ch = impl->channels[i];
-            if (ch && ch->isActive() && ch->isMemoryBacked() && ch->needsRefill()) {
+            if (ch && ch->isOwnedBy(kMemoryReader) && ch->needsRefill()) {
                 static_cast<void>(ch->refillBuffer());
             }
         }
@@ -119,9 +117,11 @@ static void mem_reader_task_func(void* param) {
  * then re-scans. This prevents a slow read on one channel from pushing another
  * into underrun: whichever channel is closest to running dry gets serviced next.
  * Sleeps (notify/timeout) between scans to avoid busy-waiting.
+ * It is the only task that closes and resets the SD-backed channels.
  */
 static void sd_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
+    constexpr bool kMemoryReader = false;
 
     ESP_LOGI(TAG, "SD reader task started.");
 
@@ -131,13 +131,15 @@ static void sd_reader_task_func(void* param) {
 
         // Refill starved channels, most-empty first, until none need it.
         for (;;) {
+            close_owned_channels(impl, kMemoryReader);
+
             AudioChannel* neediest = nullptr;
             int8_t neediest_idx = -1;
             size_t lowest_level = SIZE_MAX;
 
             for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
                 AudioChannel* ch = impl->channels[i];
-                if (ch && ch->isActive() && !ch->isMemoryBacked() && ch->needsRefill()) {
+                if (ch && ch->isOwnedBy(kMemoryReader) && ch->needsRefill()) {
                     size_t level = ch->bufferedSamples();
                     if (level < lowest_level) {
                         lowest_level = level;
@@ -183,10 +185,7 @@ AudioEngine::~AudioEngine() {
 
     if (_impl->channels) {
         for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-            if (_impl->channels[i]) {
-                _impl->channels[i]->release();
-                delete _impl->channels[i];
-            }
+            delete _impl->channels[i];
         }
         delete[] _impl->channels;
     }
@@ -194,11 +193,6 @@ AudioEngine::~AudioEngine() {
     delete _impl->mixer;
     delete[] _impl->mix_buffer;
     delete _impl->i2s;
-
-    // Delete mutex
-    if (_impl->chan_mutex) {
-        vSemaphoreDelete(_impl->chan_mutex);
-    }
 
     // Put MAX98357A in shutdown if sd_mode_pin is configured
     if (_impl->config.sd_mode_pin != GPIO_NUM_NC) {
@@ -218,6 +212,12 @@ esp_err_t AudioEngine::init() {
     ESP_LOGI(TAG, "Initializing AudioEngine (max_channels=%u, sample_rate=%lu)...",
              _impl->config.max_channels,
              static_cast<unsigned long>(_impl->config.sample_rate));
+
+    if (_impl->config.max_channels > PolyphonicMixer::MAX_CHANNELS) {
+        ESP_LOGE(TAG, "max_channels=%u exceeds the supported %u.",
+                 _impl->config.max_channels, PolyphonicMixer::MAX_CHANNELS);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     I2sTransmitter::Config i2s_cfg = {
         .bclk_pin       = _impl->config.bclk_pin,
@@ -243,12 +243,6 @@ esp_err_t AudioEngine::init() {
 
     _impl->mix_buffer = new int16_t[_impl->i2s->getFrameCount()];
     std::memset(_impl->mix_buffer, 0, _impl->i2s->getFrameCount() * sizeof(int16_t));
-
-    _impl->chan_mutex = xSemaphoreCreateMutex();
-    if (!_impl->chan_mutex) {
-        ESP_LOGE(TAG, "Failed to create channel mutex.");
-        return ESP_ERR_NO_MEM;
-    }
 
     if (_impl->config.sd_mode_pin != GPIO_NUM_NC) {
         gpio_config_t log_cfg = {
@@ -338,15 +332,9 @@ esp_err_t AudioEngine::start() {
 ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t initial_volume) {
     if (!_impl || !_impl->running) return INVALID_CHANNEL;
 
-    if (xSemaphoreTake(_impl->chan_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        ESP_LOGW(TAG, "play(): mutex timeout");
-        return INVALID_CHANNEL;
-    }
-
-    // Find first inactive channel
     ChannelId slot = INVALID_CHANNEL;
     for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-        if (_impl->channels[i] && !_impl->channels[i]->isActive()) {
+        if (_impl->channels[i] && _impl->channels[i]->claim()) {
             slot = static_cast<ChannelId>(i);
             break;
         }
@@ -355,20 +343,18 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
     if (slot == INVALID_CHANNEL) {
         ESP_LOGW(TAG, "No free channels available for: %.*s",
                  static_cast<int>(file_path.size()), file_path.data());
-        xSemaphoreGive(_impl->chan_mutex);
         return INVALID_CHANNEL;
     }
 
-    // Load the WAV file into the channel
     esp_err_t ret = _impl->channels[slot]->load(file_path, loop, initial_volume);
-    xSemaphoreGive(_impl->chan_mutex);
-
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to load: %.*s (err=%s)",
                  static_cast<int>(file_path.size()), file_path.data(),
                  esp_err_to_name(ret));
         return INVALID_CHANNEL;
     }
+
+    _impl->pending_start.fetch_or(1U << slot, std::memory_order_release);
 
     ESP_LOGI(TAG, "Playing [ch%d]: %.*s (loop=%d, vol=%u)",
              slot, static_cast<int>(file_path.size()), file_path.data(),
@@ -377,24 +363,15 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
 }
 
 void AudioEngine::stop(ChannelId id) {
-    if (!_impl || id < 0 || id >= _impl->config.max_channels) return;
+    if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return;
 
-    // Set volume to 0 — the ramp will fade out over ~5ms
-    _impl->channels[id]->setTargetVolume(0);
-
-    // Schedule release after fade-out (handled in mixer task)
-    if (xSemaphoreTake(_impl->chan_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (_impl->pending_count < AudioEngineImpl::MAX_PENDING) {
-            _impl->pending_release[_impl->pending_count++] = id;
-        }
-        xSemaphoreGive(_impl->chan_mutex);
-    }
+    _impl->channels[id]->requestStop();
 
     ESP_LOGI(TAG, "Stopping channel %d (fade-out scheduled).", id);
 }
 
 void AudioEngine::setChannelVolume(ChannelId id, uint16_t target_volume) {
-    if (!_impl || id < 0 || id >= _impl->config.max_channels) return;
+    if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return;
 
     if (_impl->channels[id]) {
         _impl->channels[id]->setTargetVolume(target_volume);

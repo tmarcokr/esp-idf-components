@@ -28,7 +28,8 @@ constexpr ChannelId INVALID_CHANNEL = -1;
  * - Volume commands are lock-free (atomic) for real-time safety
  *
  * Thread safety:
- * - play() / stop(): protected by internal mutex
+ * - play() / stop(): lock-free; every channel has an atomic lifecycle and a single
+ *   owner of its file at any time (the SD or PSRAM reader closes it, never the mixer)
  * - setChannelVolume() / setGlobalVolume(): lock-free (atomic writes)
  * - getOutputLevel(): lock-free read
  *
@@ -53,7 +54,7 @@ public:
         gpio_num_t dout_pin;                    ///< I2S data out pin
         gpio_num_t sd_mode_pin  = GPIO_NUM_NC;  ///< MAX98357A SD_MODE pin for anti-pop
         uint32_t sample_rate    = 44100;        ///< Output sample rate (Hz)
-        uint8_t max_channels    = 9;            ///< Maximum simultaneous channels
+        uint8_t max_channels    = 9;            ///< Maximum simultaneous channels (up to 32)
         uint16_t compressor_gain_threshold = 800; ///< Dynamic range compressor baseline threshold
         DcBlocker::CutoffPreset dc_cutoff = DcBlocker::CutoffPreset::Hz50; ///< High-pass filter cutoff
     };
@@ -78,7 +79,7 @@ public:
      * Must be called before start(). Initializes the I2S transmitter
      * and allocates the channel array and mixer.
      *
-     * @return esp_err_t ESP_OK on success.
+     * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_ARG if max_channels exceeds 32.
      */
     [[nodiscard]] esp_err_t init();
 
@@ -95,8 +96,8 @@ public:
     /**
      * @brief Start audio playback on an available channel.
      *
-     * Loads the WAV file, allocates a channel, and begins sample extraction.
-     * Thread-safe (mutex-protected).
+     * Claims a free channel, loads the WAV file and makes it audible from the
+     * next mixer cycle. Thread-safe (lock-free channel claim).
      *
      * @param file_path SD card path (e.g., "/sdcard/track.wav").
      * @param loop Seamless looping flag (required for background/drone channels).
@@ -111,9 +112,8 @@ public:
     /**
      * @brief Stop a channel with a brief fade-out to prevent clicks.
      *
-     * Sets volume to 0 (which triggers a ~5ms ramp-down), then releases
-     * the channel resources on the next mixer cycle.
-     * Thread-safe (mutex-protected).
+     * The mixer fades the channel to 0 over ~5ms, then its reader task closes the
+     * file and frees the channel. Never dropped. Thread-safe (lock-free).
      *
      * @param id Channel ID returned by play().
      */

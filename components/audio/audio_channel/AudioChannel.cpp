@@ -2,30 +2,37 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioChannel";
 
+static constexpr uint8_t toStatus(AudioChannel::State state) {
+    return static_cast<uint8_t>(state);
+}
+
 
 AudioChannel::AudioChannel()
-    : _active(false),
+    : _status(toStatus(State::Idle)),
       _loop_enabled(false),
-      _memory_backed(false),
-      _eof_reached(false),
       _file(nullptr),
       _wav_header{},
       _file_position(0),
+      _min_available_samples(RING_BUFFER_SAMPLES),
       _ring_buffer(static_cast<int16_t*>(
           heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM))),
       _write_index(0),
       _read_index(0),
+      _eof(false),
       _target_volume(0),
       _current_volume(0),
       _underrun_count(0),
-      _min_available_samples(RING_BUFFER_SAMPLES) {
+      _mix_state(State::Idle),
+      _mix_eof(false),
+      _mix_read(0),
+      _mix_write(0),
+      _mix_target(0) {
     if (!_ring_buffer) {
         ESP_LOGE(TAG, "Failed to allocate %zu-sample ring buffer in PSRAM.",
                  RING_BUFFER_SAMPLES);
@@ -41,24 +48,59 @@ AudioChannel::~AudioChannel() {
 }
 
 
-esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_volume) {
-    release();
+AudioChannel::State AudioChannel::state() const {
+    return stateOf(_status.load(std::memory_order_acquire));
+}
 
-    _file_path = std::string(path);
-    _memory_backed = (_file_path.rfind("/mem/", 0) == 0);
+bool AudioChannel::transition(State from, State to) {
+    uint8_t status = _status.load(std::memory_order_acquire);
+    while (stateOf(status) == from) {
+        const auto next = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(to));
+        if (_status.compare_exchange_weak(status, next,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AudioChannel::claim() {
+    uint8_t expected = toStatus(State::Idle);
+    return _status.compare_exchange_strong(expected, toStatus(State::Loading),
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_acquire);
+}
+
+
+esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_volume) {
+    if (state() != State::Loading) return ESP_ERR_INVALID_STATE;
+
+    if (!_ring_buffer) {
+        abortLoad();
+        return ESP_ERR_NO_MEM;
+    }
+
+    _file_path.assign(path);
+    const bool memory_backed = (_file_path.rfind("/mem/", 0) == 0);
 
     _file = fopen(_file_path.c_str(), "rb");
     if (!_file) {
         ESP_LOGE(TAG, "Failed to open file: %s", _file_path.c_str());
+        abortLoad();
         return ESP_ERR_NOT_FOUND;
     }
 
     esp_err_t ret = parseWavHeader(_file, _wav_header);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Invalid WAV header in: %s", _file_path.c_str());
-        fclose(_file);
-        _file = nullptr;
+        abortLoad();
         return ret;
+    }
+
+    if ((_status.load(std::memory_order_acquire) & STOP_REQUESTED_BIT) != 0) {
+        abortLoad();
+        return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Loaded: %s (%luHz, %u-bit, %u-ch, data: %lu bytes)",
@@ -70,10 +112,11 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
 
     _loop_enabled = loop;
     _file_position = 0;
-    _write_index = 0;
-    _read_index = 0;
-    _target_volume.store(std::min(initial_volume, MAX_VOLUME));
-    _current_volume = _target_volume.load();
+    _underrun_count = 0;
+    _min_available_samples = RING_BUFFER_SAMPLES;
+    const uint16_t volume = std::min(initial_volume, MAX_VOLUME);
+    _target_volume.store(volume);
+    _current_volume = volume;
 
     fseek(_file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
 
@@ -83,75 +126,134 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     // Memory-backed files fill the whole ring instantly (memcpy from PSRAM);
     // SD-backed files pre-fill only a small slice so triggering a sound holds
     // the SD lock briefly, then the reader task tops the ring up.
-    size_t prefill_target = _memory_backed ? (RING_BUFFER_SAMPLES - 1)
-                                           : INITIAL_PREFILL_SAMPLES;
-    size_t filled = readFromFile(_ring_buffer, prefill_target);
-    _write_index = filled;
-    _read_index = 0;
+    const size_t prefill_target = memory_backed ? (RING_BUFFER_SAMPLES - 1)
+                                                : INITIAL_PREFILL_SAMPLES;
+    bool eof = false;
+    const size_t filled = readFromFile(_ring_buffer, prefill_target, eof);
+    _read_index.store(0, std::memory_order_release);
+    _write_index.store(filled, std::memory_order_release);
+    _eof.store(eof, std::memory_order_release);
 
-    _active = true;
-    _eof_reached = false;
+    uint8_t expected = toStatus(State::Loading);
+    const uint8_t backing = memory_backed ? MEMORY_BACKED_BIT : 0;
+    if (!_status.compare_exchange_strong(expected, static_cast<uint8_t>(backing | toStatus(State::Ready)),
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        abortLoad();
+        return ESP_ERR_INVALID_STATE;
+    }
     return ESP_OK;
 }
 
-void AudioChannel::release() {
-    if (_active && !_file_path.empty()) {
-        ESP_LOGI(TAG, "Playback stopped: %s. Min buffer level: %zu/%zu, Underruns: %lu",
-                 _file_path.c_str(), _min_available_samples, RING_BUFFER_SAMPLES, static_cast<unsigned long>(_underrun_count));
-    }
-    _active = false;
+void AudioChannel::abortLoad() {
+    release();
+    _status.store(toStatus(State::Idle), std::memory_order_release);
+}
 
+void AudioChannel::release() {
     if (_file) {
         fclose(_file);
         _file = nullptr;
     }
 
-    _write_index = 0;
-    _read_index = 0;
+    _file_path.clear();
+    _loop_enabled = false;
     _file_position = 0;
+    _wav_header = {};
+    _min_available_samples = RING_BUFFER_SAMPLES;
+    _underrun_count = 0;
     _current_volume = 0;
     _target_volume.store(0);
-    _loop_enabled = false;
-    _memory_backed = false;
-    _eof_reached = false;
-    _file_path.clear();
-    _underrun_count = 0;
-    _min_available_samples = RING_BUFFER_SAMPLES;
-    if (_ring_buffer) {
-        std::memset(_ring_buffer, 0, RING_BUFFER_SAMPLES * sizeof(int16_t));
+    _write_index.store(0, std::memory_order_release);
+    _read_index.store(0, std::memory_order_release);
+    _eof.store(false, std::memory_order_release);
+}
+
+
+void AudioChannel::requestStop() {
+    uint8_t status = _status.load(std::memory_order_acquire);
+    const State first_seen = stateOf(status);
+    for (;;) {
+        // Warning: one sound only moves forward through State; a lower state after a failed
+        // CAS means the slot was closed and re-claimed, and the new sound must not be stopped.
+        if (stateOf(status) < first_seen) return;
+
+        uint8_t desired;
+        switch (stateOf(status)) {
+            case State::Loading:
+                if ((status & STOP_REQUESTED_BIT) != 0) return;
+                desired = static_cast<uint8_t>(status | STOP_REQUESTED_BIT);
+                break;
+            case State::Ready:
+                desired = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(State::Closing));
+                break;
+            case State::Active:
+                desired = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(State::Stopping));
+                break;
+            default:
+                return;
+        }
+        if (_status.compare_exchange_weak(status, desired,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            return;
+        }
     }
 }
 
 
+bool AudioChannel::start() {
+    return transition(State::Ready, State::Active);
+}
+
+bool AudioChannel::beginMixCycle() {
+    const State current = state();
+    if (current != State::Active && current != State::Stopping) return false;
+
+    _mix_state = current;
+    _mix_target = _target_volume.load();
+    // Warning: _eof must be loaded before _write_index (the owner stores them in the
+    // opposite order), or the last chunk of a one-shot could be skipped.
+    _mix_eof = _eof.load(std::memory_order_acquire);
+    _mix_write = _write_index.load(std::memory_order_acquire);
+    _mix_read = _read_index.load(std::memory_order_acquire);
+    return true;
+}
+
 int16_t AudioChannel::getNextSample() {
-    if (!_active) return 0;
-
-    if (_read_index == _write_index) {
-        if (_eof_reached) {
-            if (_active) {
-                ESP_LOGI(TAG, "Playback finished: %s. Min buffer level: %zu/%zu, Underruns: %lu",
-                         _file_path.c_str(), _min_available_samples, RING_BUFFER_SAMPLES, static_cast<unsigned long>(_underrun_count));
-                _active = false;
+    if (_mix_read == _mix_write) {
+        if (!_mix_eof) {
+            _underrun_count++;
+            // Rate-limit warning to once per second of continuous underruns to prevent UART starvation
+            if (_underrun_count % 44100 == 1) {
+                ESP_LOGW(TAG, "Buffer underrun on: %s (count: %lu)", _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
             }
-            return 0;
-        }
-
-        // Buffer underrun — output silence but don't deactivate.
-        _underrun_count++;
-        // Rate-limit warning to once per second of continuous underruns to prevent UART starvation
-        if (_underrun_count % 44100 == 1) {
-            ESP_LOGW(TAG, "Buffer underrun on: %s (count: %lu)", _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
         }
         return 0;
     }
 
-    int16_t sample = _ring_buffer[_read_index];
-    _read_index = (_read_index + 1) % RING_BUFFER_SAMPLES;
+    int16_t sample = _ring_buffer[_mix_read];
+    _mix_read = (_mix_read + 1) % RING_BUFFER_SAMPLES;
 
     updateVolumeRamp();
 
     int32_t scaled = (static_cast<int32_t>(sample) * static_cast<int32_t>(_current_volume)) >> 14;
     return static_cast<int16_t>(scaled);
+}
+
+void AudioChannel::endMixCycle() {
+    _read_index.store(_mix_read, std::memory_order_release);
+
+    const bool drained = (_mix_read == _mix_write);
+    if (_mix_state == State::Stopping) {
+        if (_current_volume == 0 || drained) {
+            transition(State::Stopping, State::Closing);
+        }
+    } else if (_mix_eof && drained) {
+        ESP_LOGI(TAG, "Playback finished: %s. Underruns: %lu",
+                 _file_path.c_str(), static_cast<unsigned long>(_underrun_count));
+        transition(State::Active, State::Closing);
+    }
 }
 
 void AudioChannel::setTargetVolume(uint16_t volume) {
@@ -160,7 +262,12 @@ void AudioChannel::setTargetVolume(uint16_t volume) {
 
 
 void AudioChannel::updateVolumeRamp() {
-    uint16_t target = _target_volume.load();
+    if (_mix_state == State::Stopping) {
+        _current_volume = (_current_volume > STOP_FADE_STEP) ? _current_volume - STOP_FADE_STEP : 0;
+        return;
+    }
+
+    const uint16_t target = _mix_target;
 
     if (_current_volume == target) return;
 
@@ -177,9 +284,25 @@ void AudioChannel::updateVolumeRamp() {
 }
 
 
+bool AudioChannel::isActive() const {
+    const State current = state();
+    return current == State::Ready || current == State::Active || current == State::Stopping;
+}
+
+bool AudioChannel::isMemoryBacked() const {
+    return (_status.load(std::memory_order_acquire) & MEMORY_BACKED_BIT) != 0;
+}
+
+bool AudioChannel::isOwnedBy(bool memory_reader) const {
+    const uint8_t status = _status.load(std::memory_order_acquire);
+    const State current = stateOf(status);
+    if (current == State::Idle || current == State::Loading) return false;
+    return ((status & MEMORY_BACKED_BIT) != 0) == memory_reader;
+}
+
 size_t AudioChannel::availableSamples() const {
-    size_t w = _write_index;
-    size_t r = _read_index;
+    const size_t w = _write_index.load(std::memory_order_acquire);
+    const size_t r = _read_index.load(std::memory_order_acquire);
 
     if (w >= r) {
         return w - r;
@@ -188,14 +311,21 @@ size_t AudioChannel::availableSamples() const {
 }
 
 bool AudioChannel::needsRefill() const {
-    if (!_active || !_file) return false;
+    const State current = state();
+    if (current != State::Ready && current != State::Active && current != State::Stopping) return false;
     return availableSamples() < REFILL_WATERMARK;
 }
 
 esp_err_t AudioChannel::refillBuffer() {
-    if (!_active || !_file) return ESP_ERR_NOT_FOUND;
+    const State current = state();
+    if (current != State::Ready && current != State::Active && current != State::Stopping) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!_file) return ESP_ERR_NOT_FOUND;
 
-    size_t available = availableSamples();
+    size_t write = _write_index.load(std::memory_order_acquire);
+    const size_t read = _read_index.load(std::memory_order_acquire);
+    const size_t available = (write >= read) ? (write - read) : (RING_BUFFER_SAMPLES - read + write);
     if (available < _min_available_samples) {
         _min_available_samples = available;
     }
@@ -206,53 +336,61 @@ esp_err_t AudioChannel::refillBuffer() {
 
     size_t to_read = std::min({free_space, REFILL_WATERMARK, MAX_SD_CHUNK_SAMPLES});
 
-    // Read directly into the ring buffer at _write_index. Split into up to two
+    // Read directly into the ring buffer at the write index. Split into up to two
     // contiguous reads when the target region wraps past the end of the buffer.
-    size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - _write_index);
-    size_t first = readFromFile(_ring_buffer + _write_index, contiguous);
-    _write_index = (_write_index + first) % RING_BUFFER_SAMPLES;
+    bool eof = false;
+    size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - write);
+    size_t first = readFromFile(_ring_buffer + write, contiguous, eof);
+    write = (write + first) % RING_BUFFER_SAMPLES;
 
-    size_t total_read = first;
-    if (first == contiguous && to_read > contiguous) {
-        size_t second = readFromFile(_ring_buffer + _write_index, to_read - contiguous);
-        _write_index = (_write_index + second) % RING_BUFFER_SAMPLES;
-        total_read += second;
+    if (first == contiguous && to_read > contiguous && !eof) {
+        size_t second = readFromFile(_ring_buffer + write, to_read - contiguous, eof);
+        write = (write + second) % RING_BUFFER_SAMPLES;
     }
 
-    if (total_read == 0 && !_loop_enabled) {
-        // One-shot channel reached EOF — will be deactivated when buffer drains
-        return ESP_OK;
+    _write_index.store(write, std::memory_order_release);
+    if (eof) {
+        _eof.store(true, std::memory_order_release);
     }
-
     return ESP_OK;
 }
 
+bool AudioChannel::closeIfClosing(bool memory_reader) {
+    const uint8_t status = _status.load(std::memory_order_acquire);
+    if (stateOf(status) != State::Closing) return false;
+    if (((status & MEMORY_BACKED_BIT) != 0) != memory_reader) return false;
 
-size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested) {
-    if (!_file || samples_requested == 0) return 0;
+    release();
+    _status.store(toStatus(State::Idle), std::memory_order_release);
+    return true;
+}
+
+
+size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool& eof) {
+    FILE* const file = _file;
+    if (!file || samples_requested == 0) return 0;
 
     size_t total_read = 0;
 
     while (total_read < samples_requested) {
+        if (state() == State::Closing) break;
+
         // How many bytes remain in the data section?
         uint32_t bytes_remaining = _wav_header.data_size - _file_position;
-        if (bytes_remaining == 0) {
-            if (_loop_enabled) {
-                // Seamless loop: seek back to data start
-                fseek(_file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
-                _file_position = 0;
-                bytes_remaining = _wav_header.data_size;
-            } else {
-                // One-shot: mark EOF so it deactivates when buffer completely drains
-                _eof_reached = true;
+        if (bytes_remaining < sizeof(int16_t)) {
+            if (!_loop_enabled) {
+                eof = true;
                 break;
             }
+            fseek(file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
+            _file_position = 0;
+            bytes_remaining = _wav_header.data_size;
         }
 
         size_t samples_remaining_in_file = bytes_remaining / sizeof(int16_t);
         size_t to_read = std::min(samples_requested - total_read, samples_remaining_in_file);
 
-        size_t actually_read = fread(dest + total_read, sizeof(int16_t), to_read, _file);
+        size_t actually_read = fread(dest + total_read, sizeof(int16_t), to_read, file);
         if (actually_read == 0) {
             ESP_LOGW(TAG, "Unexpected read failure on: %s", _file_path.c_str());
             break;

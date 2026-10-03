@@ -2,6 +2,7 @@
 #include "AudioChannel.hpp"
 #include "esp_log.h"
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 namespace Espressif::Wrappers::Audio {
@@ -15,7 +16,7 @@ int32_t PolyphonicMixer::volumeToCompressorGain(uint16_t q14_volume) const {
 
 PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff)
     : _channels(channels),
-      _max_channels(max_channels),
+      _max_channels(std::min(max_channels, MAX_CHANNELS)),
       _global_volume(MAX_VOLUME),
       _compressor_gain_threshold(compressor_gain_threshold),
       _compressor(volumeToCompressorGain(MAX_VOLUME)),
@@ -26,15 +27,19 @@ PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, 
 
 
 void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
+    uint32_t mixed_mask = 0;
+    for (uint8_t ch = 0; ch < _max_channels; ++ch) {
+        if (_channels[ch] && _channels[ch]->beginMixCycle()) {
+            mixed_mask |= (1U << ch);
+        }
+    }
+    const auto active = static_cast<uint8_t>(std::popcount(mixed_mask));
+
     for (size_t frame = 0; frame < frame_count; ++frame) {
         int32_t mixed = 0;
-        uint8_t active = 0;
 
-        for (uint8_t ch = 0; ch < _max_channels; ++ch) {
-            if (_channels[ch] && _channels[ch]->isActive()) {
-                mixed += static_cast<int32_t>(_channels[ch]->getNextSample());
-                ++active;
-            }
+        for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
+            mixed += static_cast<int32_t>(_channels[std::countr_zero(pending)]->getNextSample());
         }
 
         // --- CALIBRATION TELEMETRY: raw summed peak, BEFORE any DSP ---
@@ -74,6 +79,10 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
         output[frame] = sample;
 
         updateRms(sample);
+    }
+
+    for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
+        _channels[std::countr_zero(pending)]->endMixCycle();
     }
 }
 
