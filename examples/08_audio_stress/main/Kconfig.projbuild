@@ -2,13 +2,33 @@ menu "Audio Stress Test"
 
     choice STRESS_START_MODE
         prompt "Loop pair start mode"
-        default STRESS_START_MODE_SEQUENTIAL
+        default STRESS_START_MODE_LINKED
         help
-            How the controller task starts the two looping layers of a pair.
+            How the controller task and the null test start the two looping layers of a pair.
 
+        config STRESS_START_MODE_LINKED
+            bool "Linked (playLinked(), same mixer cycle)"
         config STRESS_START_MODE_SEQUENTIAL
             bool "Sequential (two play() calls)"
     endchoice
+
+    config STRESS_NULL_TEST_PERIOD_S
+        int "Null test period (s)"
+        range 5 3600
+        default 30
+        help
+            Every period the stress tasks pause for 3 s and loop_a/loop_b (b = -a) play as a
+            pair; with sample-exact alignment the mixed output cancels.
+
+    config STRESS_NULL_VOLUME
+        int "Null test layer volume (0-16384)"
+        range 0 16384
+        default 12000
+
+    config STRESS_NULL_MAX_LEVEL
+        int "Null test pass limit for getOutputLevel() (0-16384)"
+        range 0 16384
+        default 8
 
     config STRESS_DURATION_S
         int "Run time before the quiesce check (s)"

@@ -31,6 +31,7 @@ public:
      */
     struct Stats {
         uint32_t underruns;         ///< Underrun samples over all channels since construction.
+        uint32_t group_holds;       ///< Group-cycles in which a linked group was held, since construction.
         int32_t peak_in;            ///< Max |sum| before DSP since the previous takeStats().
         int32_t peak_out;           ///< Max |sample| after DSP since the previous takeStats().
         uint32_t clipped_samples;   ///< Samples at full scale after DSP since the previous takeStats().
@@ -53,7 +54,10 @@ public:
      * @brief Mix all Active and Stopping channels into the output buffer.
      *
      * Snapshots every channel once per call (beginMixCycle()), mixes the frames,
-     * then publishes the consumed samples (endMixCycle()). For each frame:
+     * then publishes the consumed samples (endMixCycle()). Active channels that share a
+     * non-zero group id are held together for the whole call (no sample consumed or output)
+     * when one of them has fewer than @p frame_count samples buffered and none has its
+     * end of file buffered, so they stay sample-aligned. For each frame:
      * 1. Sum all active channel samples into a 32-bit accumulator
      * 2. Apply global volume scaling (14-bit fixed-point)
      * 3. Apply soft-clipping to prevent DAC overflow
@@ -100,6 +104,7 @@ private:
 
     // Relaxed is enough: no other data is published or read through these counters.
     std::atomic<uint32_t> _underruns{0};
+    std::atomic<uint32_t> _group_holds{0};
     std::atomic<int32_t> _peak_in{0};
     std::atomic<int32_t> _peak_out{0};
     std::atomic<uint32_t> _clipped_samples{0};
@@ -122,6 +127,8 @@ private:
      * @param sample The final 16-bit output sample.
      */
     void updateRms(int16_t sample);
+
+    uint32_t heldChannels(uint32_t mixed_mask, size_t frame_count, uint32_t& holds);
 };
 
 } // namespace Espressif::Wrappers::Audio

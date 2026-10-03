@@ -8,8 +8,8 @@ namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioChannel";
 
-static constexpr uint8_t toStatus(AudioChannel::State state) {
-    return static_cast<uint8_t>(state);
+static constexpr uint32_t toStatus(AudioChannel::State state) {
+    return static_cast<uint32_t>(state);
 }
 
 
@@ -30,6 +30,8 @@ AudioChannel::AudioChannel()
       _underrun_count(0),
       _read_failures(0),
       _start_cycle(0),
+      _group(0),
+      _data_size(0),
       _mix_state(State::Idle),
       _mix_eof(false),
       _mix_read(0),
@@ -56,9 +58,9 @@ AudioChannel::State AudioChannel::state() const {
 }
 
 bool AudioChannel::transition(State from, State to) {
-    uint8_t status = _status.load(std::memory_order_acquire);
+    uint32_t status = _status.load(std::memory_order_acquire);
     while (stateOf(status) == from) {
-        const auto next = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(to));
+        const uint32_t next = (status & MEMORY_BACKED_BIT) | toStatus(to);
         if (_status.compare_exchange_weak(status, next,
                                           std::memory_order_acq_rel,
                                           std::memory_order_acquire)) {
@@ -69,7 +71,7 @@ bool AudioChannel::transition(State from, State to) {
 }
 
 bool AudioChannel::claim() {
-    uint8_t expected = toStatus(State::Idle);
+    uint32_t expected = toStatus(State::Idle);
     return _status.compare_exchange_strong(expected, toStatus(State::Loading),
                                            std::memory_order_acq_rel,
                                            std::memory_order_acquire);
@@ -124,6 +126,8 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     _file_position = 0;
     _underrun_count.store(0, std::memory_order_relaxed);
     _start_cycle.store(0, std::memory_order_relaxed);
+    _group.store(0, std::memory_order_relaxed);
+    _data_size.store(_wav_header.data_size, std::memory_order_relaxed);
     const uint16_t volume = std::min(initial_volume, MAX_VOLUME);
     _target_volume.store(volume);
     _current_volume = volume;
@@ -147,9 +151,9 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
         closeFile();
     }
 
-    uint8_t expected = toStatus(State::Loading);
-    const uint8_t backing = memory_backed ? MEMORY_BACKED_BIT : 0;
-    if (!_status.compare_exchange_strong(expected, static_cast<uint8_t>(backing | toStatus(State::Ready)),
+    uint32_t expected = toStatus(State::Loading);
+    const uint32_t backing = memory_backed ? MEMORY_BACKED_BIT : 0;
+    if (!_status.compare_exchange_strong(expected, backing | toStatus(State::Ready),
                                          std::memory_order_acq_rel,
                                          std::memory_order_acquire)) {
         abortLoad();
@@ -180,6 +184,8 @@ void AudioChannel::release() {
     _wav_header = {};
     _underrun_count.store(0, std::memory_order_relaxed);
     _start_cycle.store(0, std::memory_order_relaxed);
+    _group.store(0, std::memory_order_relaxed);
+    _data_size.store(0, std::memory_order_relaxed);
     _current_volume = 0;
     _target_volume.store(0);
     _write_index.store(0, std::memory_order_release);
@@ -189,24 +195,24 @@ void AudioChannel::release() {
 
 
 void AudioChannel::requestStop() {
-    uint8_t status = _status.load(std::memory_order_acquire);
+    uint32_t status = _status.load(std::memory_order_acquire);
     const State first_seen = stateOf(status);
     for (;;) {
         // Warning: one sound only moves forward through State; a lower state after a failed
         // CAS means the slot was closed and re-claimed, and the new sound must not be stopped.
         if (stateOf(status) < first_seen) return;
 
-        uint8_t desired;
+        uint32_t desired;
         switch (stateOf(status)) {
             case State::Loading:
                 if ((status & STOP_REQUESTED_BIT) != 0) return;
-                desired = static_cast<uint8_t>(status | STOP_REQUESTED_BIT);
+                desired = status | STOP_REQUESTED_BIT;
                 break;
             case State::Ready:
-                desired = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(State::Closing));
+                desired = (status & MEMORY_BACKED_BIT) | toStatus(State::Closing);
                 break;
             case State::Active:
-                desired = static_cast<uint8_t>((status & MEMORY_BACKED_BIT) | toStatus(State::Stopping));
+                desired = (status & MEMORY_BACKED_BIT) | toStatus(State::Stopping);
                 break;
             default:
                 return;
@@ -220,10 +226,61 @@ void AudioChannel::requestStop() {
 }
 
 
-bool AudioChannel::start(uint32_t cycle) {
-    if (!transition(State::Ready, State::Active)) return false;
-    _start_cycle.store(cycle, std::memory_order_relaxed);
-    return true;
+bool AudioChannel::arm(uint8_t request) {
+    uint32_t status = _status.load(std::memory_order_acquire);
+    for (;;) {
+        if (stateOf(status) != State::Ready || (status & ARMED_BIT) != 0) return false;
+        const uint32_t armed = status | ARMED_BIT | (static_cast<uint32_t>(request) << REQUEST_SHIFT);
+        if (_status.compare_exchange_weak(status, armed,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
+bool AudioChannel::isArmedFor(uint32_t status, uint8_t request) {
+    return stateOf(status) == State::Ready && (status & ARMED_BIT) != 0 &&
+           ((status & REQUEST_MASK) >> REQUEST_SHIFT) == request;
+}
+
+void AudioChannel::disarm(uint8_t request) {
+    uint32_t status = _status.load(std::memory_order_acquire);
+    while (isArmedFor(status, request)) {
+        const uint32_t ready = (status & MEMORY_BACKED_BIT) | toStatus(State::Ready);
+        if (_status.compare_exchange_weak(status, ready,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+bool AudioChannel::start(uint8_t request, uint32_t cycle) {
+    uint32_t status = _status.load(std::memory_order_acquire);
+    while (isArmedFor(status, request)) {
+        const uint32_t active = (status & MEMORY_BACKED_BIT) | toStatus(State::Active);
+        if (_status.compare_exchange_weak(status, active,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+            _start_cycle.store(cycle, std::memory_order_relaxed);
+            _group.store(0, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void AudioChannel::setGroup(uint8_t group) {
+    _group.store(group, std::memory_order_relaxed);
+}
+
+uint8_t AudioChannel::group() const {
+    return _group.load(std::memory_order_relaxed);
+}
+
+uint32_t AudioChannel::dataSize() const {
+    return _data_size.load(std::memory_order_relaxed);
 }
 
 bool AudioChannel::beginMixCycle() {
@@ -231,6 +288,9 @@ bool AudioChannel::beginMixCycle() {
     if (current != State::Active && current != State::Stopping) return false;
 
     _mix_state = current;
+    if (current == State::Stopping) {
+        _group.store(0, std::memory_order_relaxed);
+    }
     _mix_target = _target_volume.load();
     // Warning: _eof must be loaded before _write_index (the owner stores them in the
     // opposite order), or the last chunk of a one-shot could be skipped.
@@ -239,6 +299,19 @@ bool AudioChannel::beginMixCycle() {
     _mix_read = _read_index.load(std::memory_order_acquire);
     _mix_underruns = 0;
     return true;
+}
+
+uint8_t AudioChannel::mixGroup() const {
+    return (_mix_state == State::Active) ? _group.load(std::memory_order_relaxed) : 0;
+}
+
+size_t AudioChannel::mixBufferedSamples() const {
+    return (_mix_write >= _mix_read) ? (_mix_write - _mix_read)
+                                     : (RING_BUFFER_SAMPLES - _mix_read + _mix_write);
+}
+
+bool AudioChannel::mixAtEof() const {
+    return _mix_eof;
 }
 
 int16_t AudioChannel::getNextSample() {
@@ -329,7 +402,7 @@ bool AudioChannel::isMemoryBacked() const {
 }
 
 bool AudioChannel::isOwnedBy(bool memory_reader) const {
-    const uint8_t status = _status.load(std::memory_order_acquire);
+    const uint32_t status = _status.load(std::memory_order_acquire);
     const State current = stateOf(status);
     if (current == State::Idle || current == State::Loading) return false;
     return ((status & MEMORY_BACKED_BIT) != 0) == memory_reader;
@@ -391,7 +464,7 @@ size_t AudioChannel::refillBuffer() {
 }
 
 bool AudioChannel::closeIfClosing(bool memory_reader) {
-    const uint8_t status = _status.load(std::memory_order_acquire);
+    const uint32_t status = _status.load(std::memory_order_acquire);
     if (stateOf(status) != State::Closing) return false;
     if (((status & MEMORY_BACKED_BIT) != 0) != memory_reader) return false;
 

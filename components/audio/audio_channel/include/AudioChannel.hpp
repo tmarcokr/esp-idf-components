@@ -31,9 +31,11 @@ namespace Espressif::Wrappers::Audio {
  * Thread safety model:
  * - claim() / load(): caller task (only the task that won claim() may call load()).
  * - requestStop() / setTargetVolume(): any task, lock-free.
- * - start() / beginMixCycle() / getNextSample() / endMixCycle(): mixer task only.
+ * - arm() / disarm(): the task that runs AudioEngine::startGroup().
+ * - start() / setGroup() / beginMixCycle() / mix*() / getNextSample() / endMixCycle(): mixer task only.
  * - isOwnedBy() / needsRefill() / refillBuffer() / closeIfClosing(): reader tasks only.
- * - state() / isActive() / underruns() / readFailures() / startCycle() / hasOpenFile(): any task.
+ * - state() / isActive() / underruns() / readFailures() / startCycle() / group() / dataSize() /
+ *   hasOpenFile(): any task.
  */
 class AudioChannel {
 public:
@@ -111,17 +113,70 @@ public:
     void requestStop();
 
     /**
-     * @brief Mixer only: start a Ready channel (Ready → Active).
-     * @param cycle Mixer cycle counter value, reported by startCycle().
-     * @return true if the channel became Active.
+     * @brief Mark a Ready channel as a member of start request @p request.
+     *
+     * Only one request can arm a channel; the mark is dropped if the channel is stopped.
+     *
+     * @param request Start request index (0–31) owned by the caller.
+     * @return true if the channel was Ready and not armed, and is now armed for @p request.
      */
-    bool start(uint32_t cycle);
+    [[nodiscard]] bool arm(uint8_t request);
+
+    /**
+     * @brief Undo arm() if the channel is still Ready and armed for @p request.
+     * @param request Start request index passed to arm().
+     */
+    void disarm(uint8_t request);
+
+    /**
+     * @brief Mixer only: start a channel armed for @p request (Ready → Active).
+     * @param request Start request index the channel must be armed for.
+     * @param cycle Mixer cycle counter value, reported by startCycle().
+     * @return true if the channel became Active; false if it left Ready or is not armed for @p request.
+     */
+    bool start(uint8_t request, uint32_t cycle);
+
+    /**
+     * @brief Mixer only: set the linked group id of an Active channel (0 = not linked).
+     * @param group Group id.
+     */
+    void setGroup(uint8_t group);
+
+    /**
+     * @brief Linked group id; 0 when the channel is not linked or has left its group.
+     * @return The group id.
+     */
+    uint8_t group() const;
+
+    /**
+     * @brief Size of the PCM data of the current sound.
+     * @return Data size in bytes; 0 when no sound is loaded.
+     */
+    uint32_t dataSize() const;
 
     /**
      * @brief Mixer only: snapshot the channel for one mixer cycle.
      * @return true if the channel is Active or Stopping and must be mixed in this cycle.
      */
     bool beginMixCycle();
+
+    /**
+     * @brief Mixer only: group id used by the linked-group policy in this cycle.
+     * @return The group id if the channel is Active in this cycle, otherwise 0.
+     */
+    uint8_t mixGroup() const;
+
+    /**
+     * @brief Mixer only: samples buffered at the start of this cycle.
+     * @return Unread samples in the cycle snapshot.
+     */
+    size_t mixBufferedSamples() const;
+
+    /**
+     * @brief Mixer only: whether the whole file was buffered at the start of this cycle.
+     * @return true if the end of a one-shot is in the ring buffer.
+     */
+    bool mixAtEof() const;
 
     /**
      * @brief Mixer only: extract the next PCM sample with volume scaling and ramping.
@@ -281,14 +336,18 @@ private:
     /// Linear stop fade per sample: full scale to 0 in 256 samples (~5.8ms, one mixer cycle).
     static constexpr uint16_t STOP_FADE_STEP = MAX_VOLUME / 256;
 
-    /// The status byte packs the State with the backing flag (so one acquire load gives a
-    /// reader both the state and its owner) and the stop request (valid only in Loading).
-    static constexpr uint8_t STATE_MASK = 0x07;
-    static constexpr uint8_t STOP_REQUESTED_BIT = 0x40;
-    static constexpr uint8_t MEMORY_BACKED_BIT = 0x80;
+    /// The status word packs the State with the backing flag (so one acquire load gives a
+    /// reader both the state and its owner), the stop request (valid only in Loading) and
+    /// the start request a Ready channel is armed for.
+    static constexpr uint32_t STATE_MASK = 0x07;
+    static constexpr uint32_t ARMED_BIT = 0x08;
+    static constexpr uint32_t STOP_REQUESTED_BIT = 0x40;
+    static constexpr uint32_t MEMORY_BACKED_BIT = 0x80;
+    static constexpr uint32_t REQUEST_SHIFT = 8;
+    static constexpr uint32_t REQUEST_MASK = 0x1F << REQUEST_SHIFT;
 
     // --- Lifecycle ---
-    std::atomic<uint8_t> _status;
+    std::atomic<uint32_t> _status;
 
     // --- Owned by the current owner (see the class table) ---
     bool _loop_enabled;
@@ -308,11 +367,14 @@ private:
     std::atomic<uint16_t> _target_volume;
     uint16_t _current_volume;
 
-    // --- Statistics ---
-    // Relaxed is enough: no other data is published or read through these counters.
+    // --- Statistics and diagnostics ---
+    // Relaxed is enough: no other data is published or read through these values; the mixer
+    // only reads its own writes of _group, and resets are ordered by the _status hand-offs.
     std::atomic<uint32_t> _underrun_count;
     std::atomic<uint32_t> _read_failures;
     std::atomic<uint32_t> _start_cycle;
+    std::atomic<uint8_t> _group;
+    std::atomic<uint32_t> _data_size;
 
     // --- Mixer cycle snapshot (mixer task only) ---
     State _mix_state;
@@ -322,7 +384,8 @@ private:
     uint16_t _mix_target;
     uint32_t _mix_underruns;
 
-    static State stateOf(uint8_t status) { return static_cast<State>(status & STATE_MASK); }
+    static State stateOf(uint32_t status) { return static_cast<State>(status & STATE_MASK); }
+    static bool isArmedFor(uint32_t status, uint8_t request);
 
     bool transition(State from, State to);
 

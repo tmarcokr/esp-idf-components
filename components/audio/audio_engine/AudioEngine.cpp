@@ -29,13 +29,49 @@ struct AudioEngineImpl {
     TaskHandle_t mem_reader_task = nullptr;
     volatile bool running        = false;
 
-    /// Ready channels the mixer starts at the beginning of its next cycle (bit = channel).
-    std::atomic<uint32_t> pending_start{0};
+    /// Start requests in use (bit = request index), from startGroup() until the mixer has run them.
+    std::atomic<uint32_t> requests_in_use{0};
+    /// Committed start requests the mixer runs at the beginning of its next cycle.
+    std::atomic<uint32_t> committed_requests{0};
+    /// Members of each start request; written before the commit, read by the mixer after it.
+    uint32_t request_members[PolyphonicMixer::MAX_CHANNELS] = {};
+    /// Last linked group id handed out (mixer task only).
+    uint8_t last_group_id = 0;
 
     std::atomic<uint32_t> i2s_write_errors{0};
     std::atomic<uint32_t> load_failures{0};
     std::atomic<uint32_t> no_free_channels{0};
 };
+
+static uint8_t next_group_id(AudioEngineImpl* impl) {
+    for (;;) {
+        if (++impl->last_group_id == 0) impl->last_group_id = 1;
+        bool in_use = false;
+        for (uint8_t i = 0; i < impl->config.max_channels && !in_use; ++i) {
+            in_use = impl->channels[i]->group() == impl->last_group_id;
+        }
+        if (!in_use) return impl->last_group_id;
+    }
+}
+
+static void run_start_request(AudioEngineImpl* impl, uint8_t request, uint32_t cycle) {
+    uint32_t started = 0;
+    for (uint32_t pending = impl->request_members[request]; pending != 0; pending &= pending - 1) {
+        const int ch = std::countr_zero(pending);
+        if (impl->channels[ch]->start(request, cycle)) {
+            started |= (1U << ch);
+        }
+    }
+
+    if (std::popcount(started) > 1) {
+        const uint8_t group = next_group_id(impl);
+        for (uint32_t pending = started; pending != 0; pending &= pending - 1) {
+            impl->channels[std::countr_zero(pending)]->setGroup(group);
+        }
+    }
+
+    impl->requests_in_use.fetch_and(~(1U << request), std::memory_order_release);
+}
 
 static void mixer_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
@@ -47,9 +83,9 @@ static void mixer_task_func(void* param) {
     uint32_t cycle = 0;
     while (impl->running) {
         ++cycle;
-        uint32_t starting = impl->pending_start.exchange(0, std::memory_order_acq_rel);
-        for (; starting != 0; starting &= starting - 1) {
-            impl->channels[std::countr_zero(starting)]->start(cycle);
+        uint32_t committed = impl->committed_requests.exchange(0, std::memory_order_acq_rel);
+        for (; committed != 0; committed &= committed - 1) {
+            run_start_request(impl, static_cast<uint8_t>(std::countr_zero(committed)), cycle);
         }
 
         // Mix all active channels into the output buffer
@@ -337,7 +373,7 @@ esp_err_t AudioEngine::start() {
 }
 
 
-ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t initial_volume) {
+ChannelId AudioEngine::prepare(std::string_view file_path, bool loop, uint16_t initial_volume) {
     if (!_impl || !_impl->running) return INVALID_CHANNEL;
 
     ChannelId slot = INVALID_CHANNEL;
@@ -364,12 +400,97 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
         return INVALID_CHANNEL;
     }
 
-    _impl->pending_start.fetch_or(1U << slot, std::memory_order_release);
-
-    ESP_LOGD(TAG, "Playing [ch%d]: %.*s (loop=%d, vol=%u)",
+    ESP_LOGD(TAG, "Prepared [ch%d]: %.*s (loop=%d, vol=%u)",
              slot, static_cast<int>(file_path.size()), file_path.data(),
              loop, initial_volume);
     return slot;
+}
+
+esp_err_t AudioEngine::startGroup(std::span<const ChannelId> ids) {
+    if (!_impl || !_impl->channels || !_impl->running) return ESP_ERR_INVALID_STATE;
+    if (ids.empty() || ids.size() > _impl->config.max_channels) return ESP_ERR_INVALID_ARG;
+
+    uint32_t members = 0;
+    for (const ChannelId id : ids) {
+        if (id < 0 || id >= _impl->config.max_channels) return ESP_ERR_INVALID_ARG;
+        const uint32_t bit = 1U << id;
+        if ((members & bit) != 0) return ESP_ERR_INVALID_ARG;
+        members |= bit;
+    }
+
+    uint32_t in_use = _impl->requests_in_use.load(std::memory_order_acquire);
+    uint8_t request = 0;
+    for (;;) {
+        if (in_use == UINT32_MAX) return ESP_ERR_NO_MEM;
+        request = static_cast<uint8_t>(std::countr_zero(~in_use));
+        if (_impl->requests_in_use.compare_exchange_weak(in_use, in_use | (1U << request),
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+            break;
+        }
+    }
+
+    uint32_t armed = 0;
+    for (uint32_t pending = members; pending != 0; pending &= pending - 1) {
+        const int ch = std::countr_zero(pending);
+        if (!_impl->channels[ch]->arm(request)) {
+            for (uint32_t undo = armed; undo != 0; undo &= undo - 1) {
+                _impl->channels[std::countr_zero(undo)]->disarm(request);
+            }
+            _impl->requests_in_use.fetch_and(~(1U << request), std::memory_order_release);
+            return ESP_ERR_INVALID_STATE;
+        }
+        armed |= (1U << ch);
+    }
+
+    _impl->request_members[request] = members;
+    _impl->committed_requests.fetch_or(1U << request, std::memory_order_release);
+    return ESP_OK;
+}
+
+AudioEngine::LinkedChannels AudioEngine::playLinked(std::string_view path_a, std::string_view path_b,
+                                                    bool loop, uint16_t volume_a, uint16_t volume_b) {
+    const ChannelId first = prepare(path_a, loop, volume_a);
+    if (first == INVALID_CHANNEL) return {};
+
+    const ChannelId second = prepare(path_b, loop, volume_b);
+    if (second == INVALID_CHANNEL) {
+        stop(first);
+        return {};
+    }
+
+    const uint32_t size_a = _impl->channels[first]->dataSize();
+    const uint32_t size_b = _impl->channels[second]->dataSize();
+    if (size_a != size_b) {
+        ESP_LOGW(TAG, "Linked files differ in length (%lu vs %lu bytes); loops will drift: %.*s, %.*s",
+                 static_cast<unsigned long>(size_a), static_cast<unsigned long>(size_b),
+                 static_cast<int>(path_a.size()), path_a.data(),
+                 static_cast<int>(path_b.size()), path_b.data());
+    }
+
+    const ChannelId ids[] = {first, second};
+    const esp_err_t ret = startGroup(ids);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start linked pair: %s", esp_err_to_name(ret));
+        stop(first);
+        stop(second);
+        return {};
+    }
+    return {.first = first, .second = second};
+}
+
+ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t initial_volume) {
+    const ChannelId id = prepare(file_path, loop, initial_volume);
+    if (id == INVALID_CHANNEL) return INVALID_CHANNEL;
+
+    const ChannelId ids[] = {id};
+    const esp_err_t ret = startGroup(ids);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start [ch%d]: %s", id, esp_err_to_name(ret));
+        stop(id);
+        return INVALID_CHANNEL;
+    }
+    return id;
 }
 
 void AudioEngine::stop(ChannelId id) {
@@ -404,6 +525,7 @@ AudioEngine::Stats AudioEngine::getStats() {
 
     const PolyphonicMixer::Stats mix = _impl->mixer->takeStats();
     stats.underruns = mix.underruns;
+    stats.group_holds = mix.group_holds;
     stats.peak_in = mix.peak_in;
     stats.peak_out = mix.peak_out;
     stats.clipped_samples = mix.clipped_samples;
@@ -428,6 +550,7 @@ AudioEngine::ChannelInfo AudioEngine::channelInfo(ChannelId id) const {
     const AudioChannel* ch = _impl->channels[id];
     if (!ch) return info;
     info.state = static_cast<uint8_t>(ch->state());
+    info.group = ch->group();
     info.start_cycle = ch->startCycle();
     info.underruns = ch->underruns();
     return info;

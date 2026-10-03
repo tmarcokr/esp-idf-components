@@ -46,7 +46,11 @@ constexpr bool kSdContention = true;
 constexpr bool kSdContention = false;
 #endif
 
-#if CONFIG_STRESS_START_MODE_SEQUENTIAL
+#if CONFIG_STRESS_START_MODE_LINKED
+constexpr bool kLinkedStart = true;
+constexpr const char* kStartModeName = "linked";
+#else
+constexpr bool kLinkedStart = false;
 constexpr const char* kStartModeName = "sequential";
 #endif
 
@@ -92,6 +96,18 @@ constexpr UBaseType_t kShotPriority = 5;
 constexpr UBaseType_t kStormPriority = 7;
 constexpr UBaseType_t kContentionPriority = 2;
 constexpr UBaseType_t kReportPriority = 1;
+constexpr UBaseType_t kNullTestPriority = 4;
+
+constexpr uint32_t kNullPauseMs = 3000;
+constexpr uint32_t kNullSampleMs = 100;
+constexpr uint32_t kNullAckTimeoutMs = 1000;
+constexpr uint32_t kStartCheckTicks = 20;
+constexpr uint8_t kStateReady = 2;
+constexpr uint8_t kStateActive = 3;
+
+constexpr uint32_t kPairIdleBit = 1U << 0;
+constexpr uint32_t kShotIdleBit = 1U << 1;
+constexpr uint32_t kAllIdleBits = kPairIdleBit | kShotIdleBit;
 
 struct FileCloser {
     void operator()(FILE* file) const { std::fclose(file); }
@@ -241,6 +257,8 @@ struct StressContext {
 
     std::atomic<bool> pair_loading{false};
     std::atomic<ChannelId> last_pair_id{INVALID_CHANNEL};
+    std::atomic<bool> paused{false};
+    std::atomic<uint32_t> idle_workers{0};
 
     std::atomic<uint32_t> loops_started{0};
     std::atomic<uint32_t> loops_stopped{0};
@@ -249,6 +267,11 @@ struct StressContext {
     std::atomic<uint32_t> storm_stops{0};
     std::atomic<uint32_t> play_failures{0};
     std::atomic<uint32_t> contention_kib{0};
+    std::atomic<uint32_t> start_checks{0};
+    std::atomic<uint32_t> start_mismatches{0};
+    std::atomic<uint32_t> null_tests{0};
+    std::atomic<uint32_t> null_failures{0};
+    std::atomic<uint32_t> null_worst_level{0};
 };
 
 bool isStopping(const StressContext& ctx) {
@@ -258,6 +281,55 @@ bool isStopping(const StressContext& ctx) {
 bool sleepUnlessStopping(const StressContext& ctx, uint32_t ms) {
     const EventBits_t bits = xEventGroupWaitBits(ctx.stop_event, kStopBit, pdFALSE, pdTRUE, pdMS_TO_TICKS(ms));
     return (bits & kStopBit) == 0;
+}
+
+void waitWhilePaused(const StressContext& ctx) {
+    while (ctx.paused.load() && sleepUnlessStopping(ctx, 10)) {
+    }
+}
+
+void parkWhilePaused(StressContext& ctx, uint32_t idle_bit) {
+    ctx.idle_workers.fetch_or(idle_bit);
+    waitWhilePaused(ctx);
+    ctx.idle_workers.fetch_and(~idle_bit);
+}
+
+enum class Alignment { Aligned, Misaligned, Unknown };
+
+Alignment startAlignment(AudioEngine& engine, ChannelId first, ChannelId second, uint32_t& cycle_a,
+                         uint32_t& cycle_b) {
+    for (uint32_t tick = 0; tick < kStartCheckTicks; ++tick) {
+        const AudioEngine::ChannelInfo a = engine.channelInfo(first);
+        const AudioEngine::ChannelInfo b = engine.channelInfo(second);
+        cycle_a = a.start_cycle;
+        cycle_b = b.start_cycle;
+        if (cycle_a != 0 && cycle_b != 0) {
+            return (cycle_a == cycle_b) ? Alignment::Aligned : Alignment::Misaligned;
+        }
+        const auto pending = [](const AudioEngine::ChannelInfo& info) {
+            return info.start_cycle != 0 || info.state == kStateReady || info.state == kStateActive;
+        };
+        if (!pending(a) || !pending(b)) {
+            return Alignment::Unknown;
+        }
+        vTaskDelay(kPollTicks);
+    }
+    return Alignment::Unknown;
+}
+
+void checkLinkedStart(StressContext& ctx, ChannelId first, ChannelId second) {
+    uint32_t cycle_a = 0;
+    uint32_t cycle_b = 0;
+    const Alignment alignment = startAlignment(ctx.engine, first, second, cycle_a, cycle_b);
+    if (alignment == Alignment::Unknown) {
+        return;
+    }
+    ctx.start_checks.fetch_add(1, std::memory_order_relaxed);
+    if (alignment == Alignment::Misaligned) {
+        ctx.start_mismatches.fetch_add(1, std::memory_order_relaxed);
+        ESP_LOGE(TAG, "Linked start mismatch: ch%d cycle %" PRIu32 ", ch%d cycle %" PRIu32, first, cycle_a, second,
+                 cycle_b);
+    }
 }
 
 ChannelId playCounted(StressContext& ctx, const char* path, bool loop, uint16_t volume,
@@ -288,17 +360,44 @@ ChannelId playLayer(StressContext& ctx, const char* path) {
     return id;
 }
 
+void startLinkedPair(StressContext& ctx, ChannelId& layer_a, ChannelId& layer_b) {
+    const AudioEngine::LinkedChannels pair =
+        ctx.engine.playLinked(kLoopAPath, kLoopBPath, true, CONFIG_STRESS_LOOP_VOLUME, CONFIG_STRESS_LOOP_VOLUME);
+    layer_a = pair.first;
+    layer_b = pair.second;
+    if (pair.first == INVALID_CHANNEL) {
+        ctx.play_failures.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    ctx.loops_started.fetch_add(2, std::memory_order_relaxed);
+    ctx.last_pair_id.store(pair.second);
+}
+
 void startPair(StressContext& ctx, ChannelId& layer_a, ChannelId& layer_b) {
     ctx.pair_loading.store(true);
-    layer_a = playLayer(ctx, kLoopAPath);
-    layer_b = playLayer(ctx, kLoopBPath);
+    if (kLinkedStart) {
+        startLinkedPair(ctx, layer_a, layer_b);
+    } else {
+        layer_a = playLayer(ctx, kLoopAPath);
+        layer_b = playLayer(ctx, kLoopBPath);
+    }
     ctx.pair_loading.store(false);
+
+    if (kLinkedStart && layer_a != INVALID_CHANNEL) {
+        checkLinkedStart(ctx, layer_a, layer_b);
+    }
 }
 
 void pairControllerBody(StressContext& ctx) {
     ChannelId layer_a = INVALID_CHANNEL;
     ChannelId layer_b = INVALID_CHANNEL;
     do {
+        if (ctx.paused.load()) {
+            stopLayer(ctx, layer_a);
+            stopLayer(ctx, layer_b);
+            parkWhilePaused(ctx, kPairIdleBit);
+            continue;
+        }
         stopLayer(ctx, layer_a);
         stopLayer(ctx, layer_b);
         startPair(ctx, layer_a, layer_b);
@@ -309,6 +408,10 @@ void pairControllerBody(StressContext& ctx) {
 
 void shotControllerBody(StressContext& ctx) {
     do {
+        if (ctx.paused.load()) {
+            parkWhilePaused(ctx, kShotIdleBit);
+            continue;
+        }
         const ShotAsset& shot = kShots[randomBetween(0, kShots.size() - 1)];
         const ChannelId id = playCounted(ctx, shot.path, false, CONFIG_STRESS_SHOT_VOLUME, ctx.shots_played);
         if (id != INVALID_CHANNEL && randomBetween(1, CONFIG_STRESS_SHOT_STOP_ONE_IN) == 1) {
@@ -357,6 +460,88 @@ void sdContentionBody(StressContext& ctx) {
     }
 }
 
+bool waitForIdleWorkers(const StressContext& ctx) {
+    for (uint32_t waited_ms = 0; waited_ms < kNullAckTimeoutMs; waited_ms += 10) {
+        if ((ctx.idle_workers.load() & kAllIdleBits) == kAllIdleBits) {
+            return true;
+        }
+        if (!sleepUnlessStopping(ctx, 10)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+void startNullPair(StressContext& ctx, ChannelId& first, ChannelId& second) {
+    if (kLinkedStart) {
+        const AudioEngine::LinkedChannels pair =
+            ctx.engine.playLinked(kLoopAPath, kLoopBPath, true, CONFIG_STRESS_NULL_VOLUME, CONFIG_STRESS_NULL_VOLUME);
+        first = pair.first;
+        second = pair.second;
+        if (first != INVALID_CHANNEL) {
+            checkLinkedStart(ctx, first, second);
+        }
+    } else {
+        first = ctx.engine.play(kLoopAPath, true, CONFIG_STRESS_NULL_VOLUME);
+        second = ctx.engine.play(kLoopBPath, true, CONFIG_STRESS_NULL_VOLUME);
+    }
+}
+
+void runNullTest(StressContext& ctx) {
+    const int64_t pause_start_us = esp_timer_get_time();
+    ctx.paused.store(true);
+    if (!waitForIdleWorkers(ctx) || !sleepUnlessStopping(ctx, kLongestShotMs + kNullSampleMs)) {
+        ctx.paused.store(false);
+        return;
+    }
+
+    ChannelId first = INVALID_CHANNEL;
+    ChannelId second = INVALID_CHANNEL;
+    startNullPair(ctx, first, second);
+    if (first == INVALID_CHANNEL || second == INVALID_CHANNEL) {
+        ESP_LOGE(TAG, "Null test: pair start failed");
+        ctx.engine.stop(first);
+        ctx.engine.stop(second);
+        ctx.paused.store(false);
+        return;
+    }
+
+    const int64_t pause_end_us = pause_start_us + static_cast<int64_t>(kNullPauseMs) * 1000;
+    uint32_t worst_level = 0;
+    uint32_t windows = 0;
+    while (esp_timer_get_time() + static_cast<int64_t>(kNullSampleMs) * 1000 <= pause_end_us &&
+           sleepUnlessStopping(ctx, kNullSampleMs)) {
+        worst_level = std::max<uint32_t>(worst_level, ctx.engine.getOutputLevel());
+        ++windows;
+    }
+
+    ctx.engine.stop(first);
+    ctx.engine.stop(second);
+    ctx.paused.store(false);
+
+    if (windows == 0) {
+        return;
+    }
+    const bool null_ok = worst_level <= CONFIG_STRESS_NULL_MAX_LEVEL;
+    const uint32_t test_number = ctx.null_tests.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!null_ok) {
+        ctx.null_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint32_t previous_worst = ctx.null_worst_level.load(std::memory_order_relaxed);
+    while (worst_level > previous_worst &&
+           !ctx.null_worst_level.compare_exchange_weak(previous_worst, worst_level, std::memory_order_relaxed)) {
+    }
+    ESP_LOGI(TAG, "Null test #%" PRIu32 " (%s): worst level %" PRIu32 " over %" PRIu32 " windows (limit %d): %s",
+             test_number, kStartModeName, worst_level, windows, CONFIG_STRESS_NULL_MAX_LEVEL,
+             null_ok ? "PASS" : "FAIL");
+}
+
+void nullTestBody(StressContext& ctx) {
+    while (sleepUnlessStopping(ctx, CONFIG_STRESS_NULL_TEST_PERIOD_S * 1000)) {
+        runNullTest(ctx);
+    }
+}
+
 int stackFreeBytes(const char* task_name) {
     const TaskHandle_t task = xTaskGetHandle(task_name);
     return (task != nullptr) ? static_cast<int>(uxTaskGetStackHighWaterMark(task)) : -1;
@@ -379,6 +564,11 @@ void logReport(const StressContext& ctx) {
              " load_fail %" PRIu32 " no_free %" PRIu32 " read_fail %" PRIu32 " | peak in %" PRId32 " out %" PRId32 " clipped %" PRIu32,
              stats.busy_channels, stats.open_files, stats.underruns, stats.group_holds, stats.i2s_write_errors,
              stats.load_failures, stats.no_free_channels, stats.read_failures, stats.peak_in, stats.peak_out, stats.clipped_samples);
+    ESP_LOGI(TAG,
+             "start checks %" PRIu32 " mismatches %" PRIu32 " | null tests %" PRIu32 " failures %" PRIu32
+             " worst level %" PRIu32,
+             ctx.start_checks.load(), ctx.start_mismatches.load(), ctx.null_tests.load(), ctx.null_failures.load(),
+             ctx.null_worst_level.load());
 }
 
 void reportBody(StressContext& ctx) {
@@ -428,7 +618,12 @@ private:
     TaskHandle_t _handle = nullptr;
 };
 
-bool runWorkers(AudioEngine& engine) {
+struct RunResult {
+    bool completed = false;
+    bool aligned = false;
+};
+
+RunResult runWorkers(AudioEngine& engine) {
     StressContext ctx(engine);
     std::vector<std::unique_ptr<WorkerTask>> workers;
     workers.push_back(std::make_unique<WorkerTask>("pair_ctrl", pairControllerBody, ctx, kPairPriority, kControllerCore));
@@ -438,6 +633,7 @@ bool runWorkers(AudioEngine& engine) {
         workers.push_back(
             std::make_unique<WorkerTask>("sd_contention", sdContentionBody, ctx, kContentionPriority, tskNO_AFFINITY));
     }
+    workers.push_back(std::make_unique<WorkerTask>("null_test", nullTestBody, ctx, kNullTestPriority, tskNO_AFFINITY));
     workers.push_back(std::make_unique<WorkerTask>("report", reportBody, ctx, kReportPriority, tskNO_AFFINITY));
 
     const bool all_started =
@@ -451,7 +647,13 @@ bool runWorkers(AudioEngine& engine) {
     xEventGroupSetBits(ctx.stop_event, kStopBit);
     workers.clear();
     logReport(ctx);
-    return all_started;
+
+    const bool aligned = ctx.start_mismatches.load() == 0 && ctx.null_failures.load() == 0;
+    if (!kLinkedStart) {
+        ESP_LOGI(TAG, "Sequential mode: null residual worst level %" PRIu32 " (expected well above %d)",
+                 ctx.null_worst_level.load(), CONFIG_STRESS_NULL_MAX_LEVEL);
+    }
+    return {.completed = all_started, .aligned = aligned};
 }
 
 bool allChannelsReusable(AudioEngine& engine) {
@@ -511,9 +713,10 @@ void runStress() {
         return;
     }
 
-    const bool completed = runWorkers(engine);
+    const RunResult result = runWorkers(engine);
     vTaskDelay(pdMS_TO_TICKS(kLongestShotMs + kQuiesceSettleMs));
-    const bool pass = completed && allChannelsReusable(engine);
+    const bool reusable = allChannelsReusable(engine);
+    const bool pass = result.completed && reusable && (!kLinkedStart || result.aligned);
     if (pass) {
         ESP_LOGI(TAG, "PASS");
     } else {

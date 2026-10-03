@@ -38,6 +38,9 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
         }
     }
 
+    uint32_t holds = 0;
+    const uint32_t playing_mask = mixed_mask & ~heldChannels(mixed_mask, frame_count, holds);
+
     int32_t peak_in = 0;
     int32_t peak_out = 0;
     uint32_t clipped = 0;
@@ -45,7 +48,7 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
     for (size_t frame = 0; frame < frame_count; ++frame) {
         int32_t mixed = 0;
 
-        for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
+        for (uint32_t pending = playing_mask; pending != 0; pending &= pending - 1) {
             mixed += static_cast<int32_t>(_channels[std::countr_zero(pending)]->getNextSample());
         }
 
@@ -75,11 +78,47 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
     publish_max(_peak_out, peak_out);
     if (clipped != 0) _clipped_samples.fetch_add(clipped, std::memory_order_relaxed);
     if (underruns != 0) _underruns.fetch_add(underruns, std::memory_order_relaxed);
+    if (holds != 0) _group_holds.fetch_add(holds, std::memory_order_relaxed);
+}
+
+uint32_t PolyphonicMixer::heldChannels(uint32_t mixed_mask, size_t frame_count, uint32_t& holds) {
+    uint32_t linked = 0;
+    for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
+        const int ch = std::countr_zero(pending);
+        if (_channels[ch]->mixGroup() != 0) linked |= (1U << ch);
+    }
+
+    uint32_t held = 0;
+    while (linked != 0) {
+        const uint8_t group = _channels[std::countr_zero(linked)]->mixGroup();
+        uint32_t members = 0;
+        size_t min_buffered = SIZE_MAX;
+        bool any_eof = false;
+        for (uint32_t pending = linked; pending != 0; pending &= pending - 1) {
+            const int ch = std::countr_zero(pending);
+            const AudioChannel* channel = _channels[ch];
+            if (channel->mixGroup() != group) continue;
+            members |= (1U << ch);
+            min_buffered = std::min(min_buffered, channel->mixBufferedSamples());
+            any_eof = any_eof || channel->mixAtEof();
+        }
+        linked &= ~members;
+        if (std::popcount(members) < 2) {
+            _channels[std::countr_zero(members)]->setGroup(0);
+            continue;
+        }
+        if (min_buffered < frame_count && !any_eof) {
+            held |= members;
+            ++holds;
+        }
+    }
+    return held;
 }
 
 PolyphonicMixer::Stats PolyphonicMixer::takeStats() {
     return Stats{
         .underruns = _underruns.load(std::memory_order_relaxed),
+        .group_holds = _group_holds.load(std::memory_order_relaxed),
         .peak_in = _peak_in.exchange(0, std::memory_order_relaxed),
         .peak_out = _peak_out.exchange(0, std::memory_order_relaxed),
         .clipped_samples = _clipped_samples.exchange(0, std::memory_order_relaxed),
