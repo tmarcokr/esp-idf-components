@@ -44,8 +44,10 @@ public:
      */
     int32_t process(int32_t x) {
         // y[n] = x[n] - x[n-1] + R * y[n-1]
-        int64_t y = static_cast<int64_t>(x) - _x_prev
-                    + ((static_cast<int64_t>(_y_prev) * _cutoff_coeff) >> 15);
+        // The feedback is truncated toward zero (C++ division), not floored by a shift, so |y|
+        // strictly decays on silent input instead of sticking at a negative constant.
+        const int64_t feedback = (static_cast<int64_t>(_y_prev) * _cutoff_coeff) / 32768;
+        const int64_t y = static_cast<int64_t>(x) - _x_prev + feedback;
         _x_prev = x;
         _y_prev = static_cast<int32_t>(y);
         return _y_prev;
