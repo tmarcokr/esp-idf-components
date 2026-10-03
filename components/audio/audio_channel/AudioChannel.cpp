@@ -98,6 +98,12 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
         return ret;
     }
 
+    if (loop && _wav_header.data_size < sizeof(int16_t)) {
+        ESP_LOGE(TAG, "Cannot loop a WAV without samples: %s", _file_path.c_str());
+        abortLoad();
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     if ((_status.load(std::memory_order_acquire) & STOP_REQUESTED_BIT) != 0) {
         abortLoad();
         return ESP_ERR_INVALID_STATE;
@@ -133,6 +139,9 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     _read_index.store(0, std::memory_order_release);
     _write_index.store(filled, std::memory_order_release);
     _eof.store(eof, std::memory_order_release);
+    if (eof) {
+        closeFile();
+    }
 
     uint8_t expected = toStatus(State::Loading);
     const uint8_t backing = memory_backed ? MEMORY_BACKED_BIT : 0;
@@ -150,11 +159,15 @@ void AudioChannel::abortLoad() {
     _status.store(toStatus(State::Idle), std::memory_order_release);
 }
 
-void AudioChannel::release() {
+void AudioChannel::closeFile() {
     if (_file) {
         fclose(_file);
         _file = nullptr;
     }
+}
+
+void AudioChannel::release() {
+    closeFile();
 
     _file_path.clear();
     _loop_enabled = false;
@@ -313,15 +326,16 @@ size_t AudioChannel::availableSamples() const {
 bool AudioChannel::needsRefill() const {
     const State current = state();
     if (current != State::Ready && current != State::Active && current != State::Stopping) return false;
+    if (_eof.load(std::memory_order_acquire)) return false;
     return availableSamples() < REFILL_WATERMARK;
 }
 
-esp_err_t AudioChannel::refillBuffer() {
+size_t AudioChannel::refillBuffer() {
     const State current = state();
     if (current != State::Ready && current != State::Active && current != State::Stopping) {
-        return ESP_ERR_NOT_FOUND;
+        return 0;
     }
-    if (!_file) return ESP_ERR_NOT_FOUND;
+    if (!_file) return 0;
 
     size_t write = _write_index.load(std::memory_order_acquire);
     const size_t read = _read_index.load(std::memory_order_acquire);
@@ -332,7 +346,7 @@ esp_err_t AudioChannel::refillBuffer() {
 
     size_t free_space = RING_BUFFER_SAMPLES - 1 - available; // -1 to distinguish full from empty
 
-    if (free_space == 0) return ESP_OK;
+    if (free_space == 0) return 0;
 
     size_t to_read = std::min({free_space, REFILL_WATERMARK, MAX_SD_CHUNK_SAMPLES});
 
@@ -340,19 +354,21 @@ esp_err_t AudioChannel::refillBuffer() {
     // contiguous reads when the target region wraps past the end of the buffer.
     bool eof = false;
     size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - write);
-    size_t first = readFromFile(_ring_buffer + write, contiguous, eof);
-    write = (write + first) % RING_BUFFER_SAMPLES;
+    size_t total_read = readFromFile(_ring_buffer + write, contiguous, eof);
+    write = (write + total_read) % RING_BUFFER_SAMPLES;
 
-    if (first == contiguous && to_read > contiguous && !eof) {
-        size_t second = readFromFile(_ring_buffer + write, to_read - contiguous, eof);
+    if (total_read == contiguous && to_read > contiguous && !eof) {
+        const size_t second = readFromFile(_ring_buffer + write, to_read - contiguous, eof);
         write = (write + second) % RING_BUFFER_SAMPLES;
+        total_read += second;
     }
 
     _write_index.store(write, std::memory_order_release);
     if (eof) {
         _eof.store(true, std::memory_order_release);
+        closeFile();
     }
-    return ESP_OK;
+    return total_read;
 }
 
 bool AudioChannel::closeIfClosing(bool memory_reader) {
@@ -393,6 +409,9 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool&
         size_t actually_read = fread(dest + total_read, sizeof(int16_t), to_read, file);
         if (actually_read == 0) {
             ESP_LOGW(TAG, "Unexpected read failure on: %s", _file_path.c_str());
+            if (!_loop_enabled) {
+                eof = true;
+            }
             break;
         }
 

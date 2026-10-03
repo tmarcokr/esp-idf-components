@@ -77,6 +77,46 @@ static void close_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
     }
 }
 
+static int8_t find_neediest_channel(AudioEngineImpl* impl, bool memory_reader, uint32_t excluded) {
+    int8_t neediest = -1;
+    size_t lowest_level = SIZE_MAX;
+    for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
+        AudioChannel* ch = impl->channels[i];
+        if (ch == nullptr || (excluded & (1U << i)) != 0) continue;
+        if (ch->isOwnedBy(memory_reader) && ch->needsRefill()) {
+            const size_t level = ch->bufferedSamples();
+            if (level < lowest_level) {
+                lowest_level = level;
+                neediest = static_cast<int8_t>(i);
+            }
+        }
+    }
+    return neediest;
+}
+
+// Each pass refills every needy owned channel at most once, most starved first. A refill
+// that adds no sample excludes the channel until the next wake, so nothing can spin.
+static void service_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
+    uint32_t exhausted = 0;
+    for (;;) {
+        close_owned_channels(impl, memory_reader);
+
+        uint32_t served = 0;
+        for (int8_t idx = find_neediest_channel(impl, memory_reader, exhausted);
+             idx >= 0;
+             idx = find_neediest_channel(impl, memory_reader, exhausted | served)) {
+            const uint32_t bit = 1U << idx;
+            served |= bit;
+            if (impl->channels[idx]->refillBuffer() == 0) {
+                exhausted |= bit;
+            }
+        }
+
+        if ((served & ~exhausted) == 0) return;
+        if (find_neediest_channel(impl, memory_reader, exhausted) < 0) return;
+    }
+}
+
 /**
  * @brief PSRAM reader task: runs at priority 9 (just below the mixer).
  *
@@ -89,21 +129,12 @@ static void close_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
  */
 static void mem_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
-    constexpr bool kMemoryReader = true;
 
     ESP_LOGI(TAG, "PSRAM reader task started.");
 
     while (impl->running) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-
-        close_owned_channels(impl, kMemoryReader);
-
-        for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
-            AudioChannel* ch = impl->channels[i];
-            if (ch && ch->isOwnedBy(kMemoryReader) && ch->needsRefill()) {
-                static_cast<void>(ch->refillBuffer());
-            }
-        }
+        service_owned_channels(impl, true);
     }
 
     ESP_LOGI(TAG, "PSRAM reader task stopped.");
@@ -113,49 +144,20 @@ static void mem_reader_task_func(void* param) {
 /**
  * @brief SD reader task: runs at priority 6, on-demand.
  *
- * Each pass refills the most-starved channel first (lowest buffered level),
- * then re-scans. This prevents a slow read on one channel from pushing another
- * into underrun: whichever channel is closest to running dry gets serviced next.
- * Sleeps (notify/timeout) between scans to avoid busy-waiting.
+ * Refills the most-starved SD channel first so a slow read on one channel cannot
+ * push another into underrun, in bounded passes (see service_owned_channels()).
+ * Sleeps (notify/timeout) between wakes to avoid busy-waiting.
  * It is the only task that closes and resets the SD-backed channels.
  */
 static void sd_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
-    constexpr bool kMemoryReader = false;
 
     ESP_LOGI(TAG, "SD reader task started.");
 
     while (impl->running) {
         // Block until the mixer task notifies us, or a maximum of 10ms timeout
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-
-        // Refill starved channels, most-empty first, until none need it.
-        for (;;) {
-            close_owned_channels(impl, kMemoryReader);
-
-            AudioChannel* neediest = nullptr;
-            int8_t neediest_idx = -1;
-            size_t lowest_level = SIZE_MAX;
-
-            for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
-                AudioChannel* ch = impl->channels[i];
-                if (ch && ch->isOwnedBy(kMemoryReader) && ch->needsRefill()) {
-                    size_t level = ch->bufferedSamples();
-                    if (level < lowest_level) {
-                        lowest_level = level;
-                        neediest = ch;
-                        neediest_idx = static_cast<int8_t>(i);
-                    }
-                }
-            }
-
-            if (!neediest) break;
-
-            esp_err_t ret = neediest->refillBuffer();
-            if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
-                ESP_LOGW(TAG, "Refill error on channel %d: %s", neediest_idx, esp_err_to_name(ret));
-            }
-        }
+        service_owned_channels(impl, false);
     }
 
     ESP_LOGI(TAG, "SD reader task stopped.");

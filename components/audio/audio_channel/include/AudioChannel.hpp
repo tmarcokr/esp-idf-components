@@ -85,15 +85,17 @@ public:
      *
      * Opens the file, parses and validates the WAV header and fills the initial ring
      * buffer. The channel is not audible until the mixer starts it (see start()).
+     * A one-shot fully buffered by the prefill has its file closed before publication.
      * On any failure the channel is back in Idle and the caller must not touch it.
      *
      * @param path Full filesystem path (e.g., "/sdcard/track.wav").
      * @param loop Enable seamless looping (wraps to data start on EOF).
      * @param initial_volume 14-bit volume (0–16384). Channels at volume 0
      *        still advance playback position (required for dynamic crossfading).
+     *
      * @return ESP_OK on success; ESP_ERR_INVALID_STATE if the channel was not claimed or a
      *         stop was requested while loading; ESP_ERR_NO_MEM without a ring buffer;
-     *         a parse or open error otherwise.
+     *         ESP_ERR_INVALID_SIZE for a loop without samples; a parse or open error otherwise.
      */
     [[nodiscard]] esp_err_t load(std::string_view path, bool loop, uint16_t initial_volume);
 
@@ -101,8 +103,9 @@ public:
      * @brief Request a stop from any task, lock-free; never dropped.
      *
      * Ready → Closing, Active → Stopping (fade-out, then the mixer moves it to Closing).
-     * While Loading, marks the load as cancelled: load() then fails and returns the
-     * channel to Idle. No-op in Idle, Stopping and Closing.
+     * While Loading, cancels the load: load() fails and returns the channel to Idle, or,
+     * if the publication wins the race, the channel is closed right after it becomes Ready
+     * (same outcome). No-op in Idle, Stopping and Closing.
      */
     void requestStop();
 
@@ -183,7 +186,8 @@ public:
 
     /**
      * @brief Reader only: check if the ring buffer needs refilling.
-     * @return true if the channel is Ready, Active or Stopping and below the watermark.
+     * @return true if the channel is Ready, Active or Stopping, has not reached the end of a
+     *         one-shot, and is below the watermark.
      */
     bool needsRefill() const;
 
@@ -201,12 +205,15 @@ public:
      * @brief Reader only: refill the ring buffer from the file.
      *
      * Must be called only by the reader that owns the channel (see isOwnedBy()).
-     * Reads up to half the buffer capacity from the current file position and
-     * handles EOF looping internally. Stops early if the channel moves to Closing.
+     * Reads up to MAX_SD_CHUNK_SAMPLES from the current file position and handles
+     * EOF looping internally. Stops early if the channel moves to Closing. When a
+     * one-shot reaches the end of its data (or a read fails), the end is published
+     * and the file is closed at once.
      *
-     * @return ESP_OK on success, ESP_ERR_NOT_FOUND if the channel is not refillable.
+     * @return Samples added to the ring; 0 if the channel is not refillable, the ring
+     *         is full, or nothing could be read.
      */
-    [[nodiscard]] esp_err_t refillBuffer();
+    [[nodiscard]] size_t refillBuffer();
 
     /**
      * @brief Reader only: close and reset the channel if it is Closing (Closing → Idle).
@@ -282,6 +289,9 @@ private:
 
     bool transition(State from, State to);
 
+    // Warning: the caller must own the channel (claimant in Loading, owning reader otherwise).
+    void closeFile();
+
     // Warning: the caller must own the channel (claimant in Loading, owning reader in Closing).
     void release();
 
@@ -313,7 +323,7 @@ private:
      * @brief Read samples from file into a destination buffer, handling EOF/loop.
      * @param dest Destination buffer.
      * @param samples_requested Number of samples to read.
-     * @param[out] eof Set to true when a one-shot reaches the end of its data.
+     * @param[out] eof Set to true when a one-shot reaches the end of its data or a read fails.
      * @return Number of samples actually read.
      */
     size_t readFromFile(int16_t* dest, size_t samples_requested, bool& eof);
