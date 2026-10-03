@@ -1,0 +1,82 @@
+menu "Audio Stress Test"
+
+    choice STRESS_START_MODE
+        prompt "Loop pair start mode"
+        default STRESS_START_MODE_SEQUENTIAL
+        help
+            How the controller task starts the two looping layers of a pair.
+
+        config STRESS_START_MODE_SEQUENTIAL
+            bool "Sequential (two play() calls)"
+    endchoice
+
+    config STRESS_DURATION_S
+        int "Run time before the quiesce check (s)"
+        range 10 86400
+        default 600
+
+    config STRESS_MAX_CHANNELS
+        int "Audio engine channel count"
+        range 4 32
+        default 9
+
+    config STRESS_LOOP_VOLUME
+        int "Loop layer volume (0-16384)"
+        range 0 16384
+        default 4096
+
+    config STRESS_SHOT_VOLUME
+        int "One-shot volume (0-16384)"
+        range 0 16384
+        default 8192
+
+    config STRESS_PAIR_WAIT_MIN_MS
+        int "Minimum wait between pair restarts (ms)"
+        range 0 10000
+        default 2
+
+    config STRESS_PAIR_WAIT_MAX_MS
+        int "Maximum wait between pair restarts (ms)"
+        range 0 10000
+        default 30
+
+    config STRESS_SHOT_INTERVAL_MIN_MS
+        int "Minimum interval between one-shots (ms)"
+        range 0 10000
+        default 10
+
+    config STRESS_SHOT_INTERVAL_MAX_MS
+        int "Maximum interval between one-shots (ms)"
+        range 0 10000
+        default 80
+
+    config STRESS_SHOT_STOP_ONE_IN
+        int "Stop one in N one-shots early"
+        range 1 1000
+        default 3
+
+    config STRESS_SHOT_STOP_DELAY_MAX_MS
+        int "Maximum delay before an early one-shot stop (ms)"
+        range 0 1000
+        default 20
+
+    config STRESS_STORM_STOPS
+        int "stop() calls per stop storm"
+        range 1 100000
+        default 1000
+
+    config STRESS_STORM_PERIOD_S
+        int "Stop storm period (s)"
+        range 1 3600
+        default 60
+
+    config STRESS_SD_CONTENTION
+        bool "Read a scratch file in a loop to contend for the SD card"
+        default n
+
+    config STRESS_REPORT_PERIOD_S
+        int "Report period (s)"
+        range 1 3600
+        default 5
+
+endmenu

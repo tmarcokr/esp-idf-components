@@ -18,7 +18,8 @@ jobs:
           "04_sd_card_basic",
           "05_rgb_led",
           "06_sd_audio_player",
-          "07_smart_led"
+          "07_smart_led",
+          "08_audio_stress"
         ]
         target: [ "esp32s3", "esp32c6" ]
 
