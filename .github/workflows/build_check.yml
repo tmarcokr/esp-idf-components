@@ -21,7 +21,7 @@ jobs:
           "07_smart_led",
           "08_audio_stress"
         ]
-        target: [ "esp32s3", "esp32c6" ]
+        target: [ "esp32", "esp32s3", "esp32c6" ]
 
     steps:
       - name: Checkout repository
