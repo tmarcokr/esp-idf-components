@@ -90,6 +90,8 @@ public:
      * Opens the file, parses and validates the WAV header and fills the initial ring
      * buffer. The channel is not audible until the mixer starts it (see start()).
      * A one-shot fully buffered by the prefill has its file closed before publication.
+     * A header data size larger than the file is clamped to the real size (a warning is
+     * logged), so a truncated loop wraps at the real end of its data.
      * On any failure the channel is back in Idle and the caller must not touch it.
      *
      * @param path Full filesystem path (e.g., "/sdcard/track.wav").
@@ -412,6 +414,9 @@ private:
 
     // Warning: the caller must own the channel. A failed seek is counted as a read failure.
     [[nodiscard]] bool seekToData(FILE* file);
+
+    // Keeps the header value when the file size is unknown (fstat fails or reports no size).
+    void clampDataSizeToFile(FILE* file);
 
     /**
      * @brief Parse and validate a WAV file header.

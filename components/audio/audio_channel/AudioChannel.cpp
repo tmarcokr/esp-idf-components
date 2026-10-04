@@ -1,8 +1,10 @@
 #include "AudioChannel.hpp"
+#include "WavDataSize.hpp"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include <algorithm>
 #include <cstring>
+#include <sys/stat.h>
 
 namespace Espressif::Wrappers::Audio {
 
@@ -108,6 +110,8 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
         return ret;
     }
 
+    clampDataSizeToFile(_file.get());
+
     if (loop && _wav_header.data_size < sizeof(int16_t)) {
         ESP_LOGE(TAG, "Cannot loop a WAV without samples: %s", _file_path.c_str());
         abortLoad();
@@ -181,6 +185,20 @@ void AudioChannel::closeFile() {
     if (_file) {
         _file.reset();
         _file_open.store(false, std::memory_order_release);
+    }
+}
+
+void AudioChannel::clampDataSizeToFile(FILE* file) {
+    struct stat info {};
+    if (fstat(fileno(file), &info) != 0 || info.st_size <= 0) return;
+
+    const uint32_t declared = _wav_header.data_size;
+    const auto file_size = static_cast<uint64_t>(info.st_size);
+    _wav_header.data_size = clampWavDataSize(declared, _wav_header.data_offset, file_size);
+    if (wavDataAvailable(_wav_header.data_offset, file_size) < declared) {
+        ESP_LOGW(TAG, "WAV data size %lu exceeds the file, clamped to %lu: %s",
+                 static_cast<unsigned long>(declared), static_cast<unsigned long>(_wav_header.data_size),
+                 _file_path.c_str());
     }
 }
 

@@ -58,6 +58,7 @@ constexpr const char* kMountPoint = "/sdcard";
 constexpr const char* kAssetDir = "/sdcard/stress";
 constexpr const char* kLoopAPath = "/sdcard/stress/loop_a.wav";
 constexpr const char* kLoopBPath = "/sdcard/stress/loop_b.wav";
+constexpr const char* kLoopTruncPath = "/sdcard/stress/loop_trunc.wav";
 constexpr const char* kScratchPath = "/sdcard/stress/scratch.bin";
 
 constexpr uint32_t kSampleRate = 44100;
@@ -104,6 +105,9 @@ constexpr uint32_t kNullAckTimeoutMs = 1000;
 constexpr uint32_t kStartCheckTicks = 20;
 constexpr uint8_t kStateReady = 2;
 constexpr uint8_t kStateActive = 3;
+
+constexpr uint32_t kTruncDeclaredFactor = 4;
+constexpr uint32_t kTruncCheckMs = 1500;
 
 constexpr int kLifecycleCycles = 20;
 constexpr uint32_t kLifecyclePlayMs = 50;
@@ -175,7 +179,7 @@ esp_err_t closeChecked(FileHandle& file) {
     return (std::fclose(file.release()) == 0) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t writeWav(const char* path, std::span<const int16_t> samples) {
+esp_err_t writeWav(const char* path, std::span<const int16_t> samples, uint32_t declared_data_bytes = 0) {
     FileHandle file{std::fopen(path, "wb")};
     if (!file) {
         ESP_LOGE(TAG, "Cannot create %s", path);
@@ -183,7 +187,7 @@ esp_err_t writeWav(const char* path, std::span<const int16_t> samples) {
     }
 
     WavHeader header;
-    header.data_size = static_cast<uint32_t>(samples.size_bytes());
+    header.data_size = (declared_data_bytes != 0) ? declared_data_bytes : static_cast<uint32_t>(samples.size_bytes());
     header.riff_size = header.data_size + sizeof(WavHeader) - 8;
 
     if (std::fwrite(&header, sizeof(header), 1, file.get()) != 1 ||
@@ -224,6 +228,10 @@ esp_err_t generateAssets() {
 
     std::vector<int16_t> loop = generateNoise(kLoopSeed, kLoopDurationMs);
     if (const esp_err_t err = writeWav(kLoopAPath, loop); err != ESP_OK) {
+        return err;
+    }
+    const auto truncated_declared_bytes = static_cast<uint32_t>(kTruncDeclaredFactor * loop.size() * sizeof(int16_t));
+    if (const esp_err_t err = writeWav(kLoopTruncPath, loop, truncated_declared_bytes); err != ESP_OK) {
         return err;
     }
     std::transform(loop.begin(), loop.end(), loop.begin(), [](int16_t s) { return static_cast<int16_t>(-s); });
@@ -691,6 +699,30 @@ AudioEngine::Config engineConfig(gpio_num_t sd_mode_pin) {
     };
 }
 
+bool truncatedLoopCheck(AudioEngine& engine) {
+    const uint32_t read_failures_before = engine.getStats().read_failures;
+    const ChannelId id = engine.play(kLoopTruncPath, true, 0);
+    if (id == INVALID_CHANNEL) {
+        ESP_LOGE(TAG, "Truncated loop check: play failed: FAIL");
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kTruncCheckMs));
+    const uint32_t underruns = engine.channelInfo(id).underruns;
+    const uint32_t new_read_failures = engine.getStats().read_failures - read_failures_before;
+    engine.stop(id);
+    vTaskDelay(pdMS_TO_TICKS(kQuiesceSettleMs));
+
+    const bool pass = underruns == 0 && new_read_failures == 0;
+    if (pass) {
+        ESP_LOGI(TAG, "Truncated loop check: underruns %" PRIu32 ", read failures +%" PRIu32 ": PASS", underruns,
+                 new_read_failures);
+    } else {
+        ESP_LOGE(TAG, "Truncated loop check: underruns %" PRIu32 ", read failures +%" PRIu32 ": FAIL", underruns,
+                 new_read_failures);
+    }
+    return pass;
+}
+
 bool runEngineStress() {
     AudioEngine engine(engineConfig(BoardPins::kAmpSdMode));
     if (const esp_err_t err = engine.init(); err != ESP_OK) {
@@ -704,8 +736,9 @@ bool runEngineStress() {
 
     const RunResult result = runWorkers(engine);
     vTaskDelay(pdMS_TO_TICKS(kLongestShotMs + kQuiesceSettleMs));
+    const bool truncated_loop_ok = truncatedLoopCheck(engine);
     const bool reusable = allChannelsReusable(engine);
-    const bool pass = result.completed && reusable && (!kLinkedStart || result.aligned);
+    const bool pass = result.completed && truncated_loop_ok && reusable && (!kLinkedStart || result.aligned);
     if (pass) {
         ESP_LOGI(TAG, "Stress check: PASS");
     } else {
