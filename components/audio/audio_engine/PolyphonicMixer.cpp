@@ -18,9 +18,8 @@ int32_t PolyphonicMixer::volumeToCompressorGain(uint16_t q14_volume) const {
 }
 
 
-PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff)
-    : _channels(channels),
-      _max_channels(std::min(max_channels, MAX_CHANNELS)),
+PolyphonicMixer::PolyphonicMixer(std::span<AudioChannel> channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff)
+    : _channels(channels.first(std::min(channels.size(), static_cast<size_t>(MAX_CHANNELS)))),
       _global_volume(MAX_VOLUME),
       _compressor_gain_threshold(compressor_gain_threshold),
       _compressor(volumeToCompressorGain(MAX_VOLUME)),
@@ -32,8 +31,8 @@ PolyphonicMixer::PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, 
 
 void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
     uint32_t mixed_mask = 0;
-    for (uint8_t ch = 0; ch < _max_channels; ++ch) {
-        if (_channels[ch] && _channels[ch]->beginMixCycle()) {
+    for (size_t ch = 0; ch < _channels.size(); ++ch) {
+        if (_channels[ch].beginMixCycle()) {
             mixed_mask |= (1U << ch);
         }
     }
@@ -49,7 +48,7 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
         int32_t mixed = 0;
 
         for (uint32_t pending = playing_mask; pending != 0; pending &= pending - 1) {
-            mixed += static_cast<int32_t>(_channels[std::countr_zero(pending)]->getNextSample());
+            mixed += static_cast<int32_t>(_channels[std::countr_zero(pending)].getNextSample());
         }
 
         peak_in = std::max(peak_in, mixed < 0 ? -mixed : mixed);
@@ -71,7 +70,7 @@ void PolyphonicMixer::mixFrames(int16_t* output, size_t frame_count) {
 
     uint32_t underruns = 0;
     for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
-        underruns += _channels[std::countr_zero(pending)]->endMixCycle();
+        underruns += _channels[std::countr_zero(pending)].endMixCycle();
     }
 
     publish_max(_peak_in, peak_in);
@@ -85,26 +84,26 @@ uint32_t PolyphonicMixer::heldChannels(uint32_t mixed_mask, size_t frame_count, 
     uint32_t linked = 0;
     for (uint32_t pending = mixed_mask; pending != 0; pending &= pending - 1) {
         const int ch = std::countr_zero(pending);
-        if (_channels[ch]->mixGroup() != 0) linked |= (1U << ch);
+        if (_channels[ch].mixGroup() != 0) linked |= (1U << ch);
     }
 
     uint32_t held = 0;
     while (linked != 0) {
-        const uint8_t group = _channels[std::countr_zero(linked)]->mixGroup();
+        const uint8_t group = _channels[std::countr_zero(linked)].mixGroup();
         uint32_t members = 0;
         size_t min_buffered = SIZE_MAX;
         bool any_eof = false;
         for (uint32_t pending = linked; pending != 0; pending &= pending - 1) {
             const int ch = std::countr_zero(pending);
-            const AudioChannel* channel = _channels[ch];
-            if (channel->mixGroup() != group) continue;
+            const AudioChannel& channel = _channels[ch];
+            if (channel.mixGroup() != group) continue;
             members |= (1U << ch);
-            min_buffered = std::min(min_buffered, channel->mixBufferedSamples());
-            any_eof = any_eof || channel->mixAtEof();
+            min_buffered = std::min(min_buffered, channel.mixBufferedSamples());
+            any_eof = any_eof || channel.mixAtEof();
         }
         linked &= ~members;
         if (std::popcount(members) < 2) {
-            _channels[std::countr_zero(members)]->setGroup(0);
+            _channels[std::countr_zero(members)].setGroup(0);
             continue;
         }
         if (min_buffered < frame_count && !any_eof) {

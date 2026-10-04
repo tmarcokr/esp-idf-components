@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "DynamicRangeCompressor.hpp"
 #include "DcBlocker.hpp"
@@ -39,12 +40,14 @@ public:
 
     /**
      * @brief Construct a new Polyphonic Mixer.
-     * @param channels Pointer to the array of AudioChannel pointers.
-     * @param max_channels Number of channels in the array (clamped to MAX_CHANNELS).
+     *
+     * Warning: @p channels must outlive the mixer; only the first MAX_CHANNELS are mixed.
+     *
+     * @param channels Channel storage owned by the caller.
      * @param compressor_gain_threshold Baseline threshold for the dynamic range compressor.
      * @param dc_cutoff High-pass filter cutoff preset for the DC Blocker.
      */
-    PolyphonicMixer(AudioChannel** channels, uint8_t max_channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff);
+    PolyphonicMixer(std::span<AudioChannel> channels, uint16_t compressor_gain_threshold, DcBlocker::CutoffPreset dc_cutoff);
     ~PolyphonicMixer() = default;
 
     PolyphonicMixer(const PolyphonicMixer&) = delete;
@@ -94,8 +97,7 @@ public:
     Stats takeStats();
 
 private:
-    AudioChannel** _channels;
-    uint8_t _max_channels;
+    std::span<AudioChannel> _channels;
     uint16_t _global_volume;
     uint16_t _compressor_gain_threshold;
 

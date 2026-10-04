@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -311,7 +312,7 @@ public:
 private:
     /// Ring buffer capacity in samples (16384 samples = 32KB @ 16-bit, ~371ms).
     /// Large slack absorbs SD-reader stalls on big files (magnetic profile).
-    /// Allocated in PSRAM (not internal RAM) — see constructor.
+    /// Allocated in PSRAM (not internal RAM) — see allocateRingBuffer().
     static constexpr size_t RING_BUFFER_SAMPLES = 16384;
 
     /// Watermark threshold: refill when available samples drop below this.
@@ -346,18 +347,28 @@ private:
     static constexpr uint32_t REQUEST_SHIFT = 8;
     static constexpr uint32_t REQUEST_MASK = 0x1F << REQUEST_SHIFT;
 
+    struct FileCloser {
+        void operator()(FILE* file) const { static_cast<void>(std::fclose(file)); }
+    };
+
+    struct RingBufferFree {
+        void operator()(int16_t* samples) const;
+    };
+
+    using RingBuffer = std::unique_ptr<int16_t[], RingBufferFree>;
+
     // --- Lifecycle ---
     std::atomic<uint32_t> _status;
 
     // --- Owned by the current owner (see the class table) ---
     bool _loop_enabled;
     std::string _file_path;
-    FILE* _file;
+    std::unique_ptr<FILE, FileCloser> _file;
     WavHeader _wav_header;
     uint32_t _file_position;        ///< Current read position in data section (bytes)
 
     // --- Ring Buffer (allocated in PSRAM) ---
-    int16_t* _ring_buffer;              ///< PSRAM-backed, RING_BUFFER_SAMPLES capacity
+    RingBuffer _ring_buffer;            ///< PSRAM-backed, RING_BUFFER_SAMPLES capacity
     std::atomic<size_t> _write_index;   ///< Next write position (owner; released after the samples)
     std::atomic<size_t> _read_index;    ///< Next read position (mixer; released after consuming)
     std::atomic<bool> _eof;             ///< One-shot fully buffered (released after _write_index)
@@ -387,6 +398,8 @@ private:
     static State stateOf(uint32_t status) { return static_cast<State>(status & STATE_MASK); }
     static bool isArmedFor(uint32_t status, uint8_t request);
 
+    static RingBuffer allocateRingBuffer();
+
     bool transition(State from, State to);
 
     // Warning: the caller must own the channel (claimant in Loading, owning reader otherwise).
@@ -396,6 +409,9 @@ private:
     void release();
 
     void abortLoad();
+
+    // Warning: the caller must own the channel. A failed seek is counted as a read failure.
+    [[nodiscard]] bool seekToData(FILE* file);
 
     /**
      * @brief Parse and validate a WAV file header.

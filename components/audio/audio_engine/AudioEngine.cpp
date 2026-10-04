@@ -1,33 +1,120 @@
 #include "AudioEngine.hpp"
 #include "AudioChannel.hpp"
 #include "I2sTransmitter.hpp"
+#include "InternalRam.hpp"
 #include "PolyphonicMixer.hpp"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include <atomic>
 #include <bit>
 #include <cstdint>
-#include <cstring>
+#include <memory>
+#include <span>
+#include <vector>
 
 namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioEngine";
 
+struct TaskSpec {
+    const char* name;
+    uint32_t stack_bytes;
+    UBaseType_t priority;
+};
+
+static constexpr TaskSpec kMixerTask{"audio_mixer", 4096, 10};
+static constexpr TaskSpec kMemReaderTask{"audio_mem_reader", 4096, 9};
+static constexpr TaskSpec kSdReaderTask{"audio_sd_reader", 8192, 6};
+
+#if CONFIG_IDF_TARGET_ESP32S3
+static constexpr BaseType_t kAudioCore = 1;
+#else
+static constexpr BaseType_t kAudioCore = tskNO_AFFINITY;
+#endif
+
+static constexpr uint32_t kDmaFrameCount = 256;
+static constexpr uint32_t kDmaDescCount = 4;
+
+static constexpr uint32_t kRefillRequest = 1U << 0;
+static constexpr uint32_t kStopRequest = 1U << 1;
+static constexpr TickType_t kReaderWakePeriod = pdMS_TO_TICKS(10);
+static constexpr TickType_t kI2sErrorBackoff = pdMS_TO_TICKS(10);
+static constexpr TickType_t kAmpEnableDelay = pdMS_TO_TICKS(50);
+
+// Well above the longest mixer cycle (1 s I2S write timeout plus back-off) and one bounded
+// reader pass, so an expired wait means a stuck task, not a slow one.
+static constexpr TickType_t kTaskExitTimeout = pdMS_TO_TICKS(5000);
+
+
+class EngineTask {
+public:
+    EngineTask() : _exited(xSemaphoreCreateBinaryStatic(&_exited_storage)) {}
+    ~EngineTask() { vSemaphoreDelete(_exited); }
+
+    EngineTask(const EngineTask&) = delete;
+    EngineTask& operator=(const EngineTask&) = delete;
+
+    bool spawn(TaskFunction_t entry, const TaskSpec& spec, AudioEngineImpl* impl) {
+        TaskHandle_t handle = nullptr;
+        if (xTaskCreatePinnedToCore(entry, spec.name, spec.stack_bytes, impl, spec.priority, &handle,
+                                    kAudioCore) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create task %s.", spec.name);
+            return false;
+        }
+        _handle = handle;
+        return true;
+    }
+
+    bool isRunning() const { return _handle != nullptr; }
+
+    // Warning: only valid while the task cannot exit on its own (a reader before its stop
+    // request, see join()); notifying a deleted task is a use-after-free.
+    void notify(uint32_t requests) const { xTaskNotify(_handle, requests, eSetBits); }
+
+    bool join(bool send_stop_request, TickType_t timeout) {
+        if (_handle == nullptr) return true;
+        if (send_stop_request && !_stop_requested) {
+            notify(kStopRequest);
+            _stop_requested = true;
+        }
+        if (xSemaphoreTake(_exited, timeout) != pdTRUE) return false;
+        _handle = nullptr;
+        _stop_requested = false;
+        return true;
+    }
+
+    void exitFromTask() {
+        const SemaphoreHandle_t exited = _exited;
+        // Warning: the engine may free this object as soon as the semaphore is given.
+        xSemaphoreGive(exited);
+        vTaskDelete(nullptr);
+    }
+
+private:
+    TaskHandle_t _handle = nullptr;
+    bool _stop_requested = false;
+    StaticSemaphore_t _exited_storage{};
+    SemaphoreHandle_t _exited;
+};
+
 
 struct AudioEngineImpl {
+    explicit AudioEngineImpl(const AudioEngine::Config& engine_config) : config(engine_config) {}
+
     AudioEngine::Config config;
 
-    I2sTransmitter* i2s          = nullptr;
-    AudioChannel** channels      = nullptr;
-    PolyphonicMixer* mixer       = nullptr;
-    int16_t* mix_buffer          = nullptr;
+    std::unique_ptr<I2sTransmitter> i2s;
+    InternalRam::Array<AudioChannel> channels;
+    InternalRam::Ptr<PolyphonicMixer> mixer;
+    std::vector<int16_t> mix_buffer;
 
-    TaskHandle_t mixer_task      = nullptr;
-    TaskHandle_t reader_task     = nullptr;
-    TaskHandle_t mem_reader_task = nullptr;
-    volatile bool running        = false;
+    EngineTask mixer_task;
+    EngineTask mem_reader_task;
+    EngineTask sd_reader_task;
+    std::atomic<bool> running{false};
 
     /// Start requests in use (bit = request index), from startGroup() until the mixer has run them.
     std::atomic<uint32_t> requests_in_use{0};
@@ -48,7 +135,7 @@ static uint8_t next_group_id(AudioEngineImpl* impl) {
         if (++impl->last_group_id == 0) impl->last_group_id = 1;
         bool in_use = false;
         for (uint8_t i = 0; i < impl->config.max_channels && !in_use; ++i) {
-            in_use = impl->channels[i]->group() == impl->last_group_id;
+            in_use = impl->channels[i].group() == impl->last_group_id;
         }
         if (!in_use) return impl->last_group_id;
     }
@@ -58,7 +145,7 @@ static void run_start_request(AudioEngineImpl* impl, uint8_t request, uint32_t c
     uint32_t started = 0;
     for (uint32_t pending = impl->request_members[request]; pending != 0; pending &= pending - 1) {
         const int ch = std::countr_zero(pending);
-        if (impl->channels[ch]->start(request, cycle)) {
+        if (impl->channels[ch].start(request, cycle)) {
             started |= (1U << ch);
         }
     }
@@ -66,7 +153,7 @@ static void run_start_request(AudioEngineImpl* impl, uint8_t request, uint32_t c
     if (std::popcount(started) > 1) {
         const uint8_t group = next_group_id(impl);
         for (uint32_t pending = started; pending != 0; pending &= pending - 1) {
-            impl->channels[std::countr_zero(pending)]->setGroup(group);
+            impl->channels[std::countr_zero(pending)].setGroup(group);
         }
     }
 
@@ -75,47 +162,38 @@ static void run_start_request(AudioEngineImpl* impl, uint8_t request, uint32_t c
 
 static void mixer_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
-    const size_t frame_count = impl->i2s->getFrameCount();
+    int16_t* const output = impl->mix_buffer.data();
+    const size_t frame_count = impl->mix_buffer.size();
 
     ESP_LOGI(TAG, "Mixer task started (%lu frames/cycle).",
              static_cast<unsigned long>(frame_count));
 
     uint32_t cycle = 0;
-    while (impl->running) {
+    while (impl->running.load(std::memory_order_acquire)) {
         ++cycle;
         uint32_t committed = impl->committed_requests.exchange(0, std::memory_order_acq_rel);
         for (; committed != 0; committed &= committed - 1) {
             run_start_request(impl, static_cast<uint8_t>(std::countr_zero(committed)), cycle);
         }
 
-        // Mix all active channels into the output buffer
-        impl->mixer->mixFrames(impl->mix_buffer, frame_count);
+        impl->mixer->mixFrames(output, frame_count);
 
-        // Write to I2S DMA (blocks until DMA buffer available)
-        esp_err_t ret = impl->i2s->write(impl->mix_buffer, frame_count);
-        if (ret != ESP_OK) {
+        if (impl->i2s->write(output, frame_count) != ESP_OK) {
             impl->i2s_write_errors.fetch_add(1, std::memory_order_relaxed);
-            vTaskDelay(pdMS_TO_TICKS(10)); // Prevent CPU spinlock on I2S stall
+            vTaskDelay(kI2sErrorBackoff); // Prevent CPU spinlock on I2S stall
         }
 
-        if (impl->mem_reader_task) {
-            xTaskNotifyGive(impl->mem_reader_task);
-        }
-        if (impl->reader_task) {
-            xTaskNotifyGive(impl->reader_task);
-        }
+        impl->mem_reader_task.notify(kRefillRequest);
+        impl->sd_reader_task.notify(kRefillRequest);
     }
 
     ESP_LOGI(TAG, "Mixer task stopped.");
-    vTaskDelete(nullptr);
+    impl->mixer_task.exitFromTask();
 }
 
 static void close_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
     for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
-        AudioChannel* ch = impl->channels[i];
-        if (ch) {
-            ch->closeIfClosing(memory_reader);
-        }
+        impl->channels[i].closeIfClosing(memory_reader);
     }
 }
 
@@ -123,10 +201,10 @@ static int8_t find_neediest_channel(AudioEngineImpl* impl, bool memory_reader, u
     int8_t neediest = -1;
     size_t lowest_level = SIZE_MAX;
     for (uint8_t i = 0; i < impl->config.max_channels; ++i) {
-        AudioChannel* ch = impl->channels[i];
-        if (ch == nullptr || (excluded & (1U << i)) != 0) continue;
-        if (ch->isOwnedBy(memory_reader) && ch->needsRefill()) {
-            const size_t level = ch->bufferedSamples();
+        if ((excluded & (1U << i)) != 0) continue;
+        const AudioChannel& ch = impl->channels[i];
+        if (ch.isOwnedBy(memory_reader) && ch.needsRefill()) {
+            const size_t level = ch.bufferedSamples();
             if (level < lowest_level) {
                 lowest_level = level;
                 neediest = static_cast<int8_t>(i);
@@ -149,13 +227,26 @@ static void service_owned_channels(AudioEngineImpl* impl, bool memory_reader) {
              idx = find_neediest_channel(impl, memory_reader, exhausted | served)) {
             const uint32_t bit = 1U << idx;
             served |= bit;
-            if (impl->channels[idx]->refillBuffer() == 0) {
+            if (impl->channels[idx].refillBuffer() == 0) {
                 exhausted |= bit;
             }
         }
 
         if ((served & ~exhausted) == 0) return;
         if (find_neediest_channel(impl, memory_reader, exhausted) < 0) return;
+    }
+}
+
+// Warning: a reader exits only on a stop request, never on its own, so the mixer can keep
+// notifying it until the mixer itself has been joined (see stop_tasks()).
+static void run_reader(AudioEngineImpl* impl, bool memory_reader) {
+    for (;;) {
+        uint32_t requests = 0;
+        if (xTaskNotifyWait(0, UINT32_MAX, &requests, kReaderWakePeriod) == pdTRUE &&
+            (requests & kStopRequest) != 0) {
+            return;
+        }
+        service_owned_channels(impl, memory_reader);
     }
 }
 
@@ -173,14 +264,9 @@ static void mem_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
 
     ESP_LOGI(TAG, "PSRAM reader task started.");
-
-    while (impl->running) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-        service_owned_channels(impl, true);
-    }
-
+    run_reader(impl, true);
     ESP_LOGI(TAG, "PSRAM reader task stopped.");
-    vTaskDelete(nullptr);
+    impl->mem_reader_task.exitFromTask();
 }
 
 /**
@@ -195,111 +281,127 @@ static void sd_reader_task_func(void* param) {
     auto* impl = static_cast<AudioEngineImpl*>(param);
 
     ESP_LOGI(TAG, "SD reader task started.");
-
-    while (impl->running) {
-        // Block until the mixer task notifies us, or a maximum of 10ms timeout
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-        service_owned_channels(impl, false);
-    }
-
+    run_reader(impl, false);
     ESP_LOGI(TAG, "SD reader task stopped.");
-    vTaskDelete(nullptr);
+    impl->sd_reader_task.exitFromTask();
+}
+
+// Warning: the mixer notifies both readers every cycle, so the readers are stopped only
+// after the mixer has been joined. Returns false if a task is still running.
+static bool stop_tasks(AudioEngineImpl& impl) {
+    impl.running.store(false, std::memory_order_release);
+    if (!impl.mixer_task.join(false, kTaskExitTimeout)) return false;
+    const bool mem_reader_joined = impl.mem_reader_task.join(true, kTaskExitTimeout);
+    const bool sd_reader_joined = impl.sd_reader_task.join(true, kTaskExitTimeout);
+    return mem_reader_joined && sd_reader_joined;
+}
+
+static esp_err_t set_amp_enabled(const AudioEngine::Config& config, bool enabled) {
+    if (config.sd_mode_pin == GPIO_NUM_NC) return ESP_OK;
+    return gpio_set_level(config.sd_mode_pin, enabled ? 1 : 0);
+}
+
+static esp_err_t configure_amp_pin(const AudioEngine::Config& config) {
+    if (config.sd_mode_pin == GPIO_NUM_NC) return ESP_OK;
+
+    const gpio_config_t pin_config = {
+        .pin_bit_mask = (1ULL << config.sd_mode_pin),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    if (const esp_err_t ret = gpio_config(&pin_config); ret != ESP_OK) return ret;
+    if (const esp_err_t ret = set_amp_enabled(config, false); ret != ESP_OK) return ret;
+
+    ESP_LOGI(TAG, "SD_MODE pin initialized to LOW (Shutdown).");
+    return ESP_OK;
 }
 
 
+void AudioEngine::ImplDeleter::operator()(AudioEngineImpl* impl) const {
+    InternalRam::Deleter{}(impl);
+}
+
 AudioEngine::AudioEngine(const Config& config)
-    : _impl(new AudioEngineImpl{.config = config}) {}
+    : _impl(InternalRam::make<AudioEngineImpl, ImplDeleter>(config)) {
+    if (!_impl) {
+        ESP_LOGE(TAG, "Cannot allocate the engine state in internal RAM.");
+    }
+}
 
 AudioEngine::~AudioEngine() {
     if (!_impl) return;
 
-    // Signal tasks to stop
-    _impl->running = false;
+    const bool joined = stop_tasks(*_impl);
 
-    // Wait for tasks to terminate
-    if (_impl->mixer_task) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    if (_impl->reader_task) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    if (_impl->mem_reader_task) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    if (_impl->channels) {
-        for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-            delete _impl->channels[i];
+    if (_impl->i2s) {
+        if (const esp_err_t ret = set_amp_enabled(_impl->config, false); ret != ESP_OK) {
+            ESP_LOGE(TAG, "Cannot put the amplifier in shutdown: %s", esp_err_to_name(ret));
         }
-        delete[] _impl->channels;
     }
 
-    delete _impl->mixer;
-    delete[] _impl->mix_buffer;
-    delete _impl->i2s;
-
-    // Put MAX98357A in shutdown if sd_mode_pin is configured
-    if (_impl->config.sd_mode_pin != GPIO_NUM_NC) {
-        gpio_set_level(_impl->config.sd_mode_pin, 0);
+    if (!joined) {
+        ESP_LOGE(TAG, "Audio tasks did not exit; leaking the engine instead of freeing it under them.");
+        // Warning: a task may still use the engine state, so it must never be freed.
+        static_cast<void>(_impl.release());
+        return;
     }
 
-    delete _impl;
-    _impl = nullptr;
-
+    _impl.reset();
     ESP_LOGI(TAG, "AudioEngine destroyed.");
 }
 
 
 esp_err_t AudioEngine::init() {
-    if (!_impl) return ESP_ERR_INVALID_STATE;
+    if (!_impl) return ESP_ERR_NO_MEM;
+    if (_impl->i2s) return ESP_ERR_INVALID_STATE;
 
+    const Config& config = _impl->config;
     ESP_LOGI(TAG, "Initializing AudioEngine (max_channels=%u, sample_rate=%lu)...",
-             _impl->config.max_channels,
-             static_cast<unsigned long>(_impl->config.sample_rate));
+             config.max_channels, static_cast<unsigned long>(config.sample_rate));
 
-    if (_impl->config.max_channels > PolyphonicMixer::MAX_CHANNELS) {
-        ESP_LOGE(TAG, "max_channels=%u exceeds the supported %u.",
-                 _impl->config.max_channels, PolyphonicMixer::MAX_CHANNELS);
+    if (config.max_channels == 0 || config.max_channels > PolyphonicMixer::MAX_CHANNELS) {
+        ESP_LOGE(TAG, "max_channels=%u is outside the supported 1..%u.",
+                 config.max_channels, PolyphonicMixer::MAX_CHANNELS);
         return ESP_ERR_INVALID_ARG;
     }
 
-    I2sTransmitter::Config i2s_cfg = {
-        .bclk_pin       = _impl->config.bclk_pin,
-        .ws_pin         = _impl->config.ws_pin,
-        .dout_pin       = _impl->config.dout_pin,
-        .sample_rate    = _impl->config.sample_rate,
-        .dma_frame_count = 256,
-        .dma_desc_count  = 4
-    };
-    _impl->i2s = new I2sTransmitter(i2s_cfg);
-    esp_err_t ret = _impl->i2s->init();
-    if (ret != ESP_OK) {
+    auto i2s = std::make_unique<I2sTransmitter>(I2sTransmitter::Config{
+        .bclk_pin        = config.bclk_pin,
+        .ws_pin          = config.ws_pin,
+        .dout_pin        = config.dout_pin,
+        .sample_rate     = config.sample_rate,
+        .dma_frame_count = kDmaFrameCount,
+        .dma_desc_count  = kDmaDescCount,
+    });
+    if (const esp_err_t ret = i2s->init(); ret != ESP_OK) {
         ESP_LOGE(TAG, "I2S initialization failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    _impl->channels = new AudioChannel*[_impl->config.max_channels];
-    for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-        _impl->channels[i] = new AudioChannel();
+    auto channels = InternalRam::makeArray<AudioChannel>(config.max_channels);
+    if (!channels) {
+        ESP_LOGE(TAG, "Cannot allocate %u channels in internal RAM.", config.max_channels);
+        return ESP_ERR_NO_MEM;
     }
 
-    _impl->mixer = new PolyphonicMixer(_impl->channels, _impl->config.max_channels, _impl->config.compressor_gain_threshold, _impl->config.dc_cutoff);
-
-    _impl->mix_buffer = new int16_t[_impl->i2s->getFrameCount()];
-    std::memset(_impl->mix_buffer, 0, _impl->i2s->getFrameCount() * sizeof(int16_t));
-
-    if (_impl->config.sd_mode_pin != GPIO_NUM_NC) {
-        gpio_config_t log_cfg = {
-            .pin_bit_mask = (1ULL << _impl->config.sd_mode_pin),
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        gpio_config(&log_cfg);
-        gpio_set_level(_impl->config.sd_mode_pin, 0); // Keep in shutdown
-        ESP_LOGI(TAG, "SD_MODE pin initialized to LOW (Shutdown).");
+    auto mixer = InternalRam::make<PolyphonicMixer>(std::span<AudioChannel>(channels.get(), config.max_channels),
+                                                    config.compressor_gain_threshold, config.dc_cutoff);
+    if (!mixer) {
+        ESP_LOGE(TAG, "Cannot allocate the mixer in internal RAM.");
+        return ESP_ERR_NO_MEM;
     }
+
+    if (const esp_err_t ret = configure_amp_pin(config); ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD_MODE pin configuration failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    _impl->mix_buffer.assign(i2s->getFrameCount(), 0);
+    _impl->i2s = std::move(i2s);
+    _impl->channels = std::move(channels);
+    _impl->mixer = std::move(mixer);
 
     ESP_LOGI(TAG, "AudioEngine initialized successfully.");
     return ESP_OK;
@@ -309,76 +411,45 @@ esp_err_t AudioEngine::init() {
 esp_err_t AudioEngine::start() {
     if (!_impl || !_impl->i2s) return ESP_ERR_INVALID_STATE;
 
-    _impl->running = true;
+    AudioEngineImpl& impl = *_impl;
+    if (impl.mixer_task.isRunning() || impl.mem_reader_task.isRunning() || impl.sd_reader_task.isRunning()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-#if CONFIG_IDF_TARGET_ESP32S3
-    constexpr int kAudioCore = 1;
-#else
-    constexpr int kAudioCore = tskNO_AFFINITY;
-#endif
-
-    BaseType_t result = xTaskCreatePinnedToCore(
-        mixer_task_func,
-        "audio_mixer",
-        4096,
-        _impl,
-        10,     // Priority 10 (highest audio)
-        &_impl->mixer_task,
-        kAudioCore
-    );
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create mixer task.");
-        _impl->running = false;
+    // Warning: the readers must exist before the mixer, which notifies them every cycle.
+    const bool readers_created = impl.mem_reader_task.spawn(mem_reader_task_func, kMemReaderTask, &impl) &&
+                                 impl.sd_reader_task.spawn(sd_reader_task_func, kSdReaderTask, &impl);
+    if (readers_created) {
+        impl.running.store(true, std::memory_order_release);
+    }
+    if (!readers_created || !impl.mixer_task.spawn(mixer_task_func, kMixerTask, &impl)) {
+        if (!stop_tasks(impl)) {
+            ESP_LOGE(TAG, "Audio tasks did not exit after a failed start.");
+        }
         return ESP_ERR_NO_MEM;
     }
 
-    result = xTaskCreatePinnedToCore(
-        sd_reader_task_func,
-        "audio_sd_reader",
-        8192,
-        _impl,
-        6,      // Priority 6 (below mixer=10, above app tasks) — keep SD refills timely
-        &_impl->reader_task,
-        kAudioCore
-    );
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create SD reader task.");
-        _impl->running = false;
-        return ESP_ERR_NO_MEM;
-    }
-
-    result = xTaskCreatePinnedToCore(
-        mem_reader_task_func,
-        "audio_mem_reader",
-        4096,
-        _impl,
-        9,      // Priority 9 (just below mixer=10, above SD reader=6)
-        &_impl->mem_reader_task,
-        kAudioCore
-    );
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create PSRAM reader task.");
-        _impl->running = false;
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (_impl->config.sd_mode_pin != GPIO_NUM_NC) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        gpio_set_level(_impl->config.sd_mode_pin, 1);
+    if (impl.config.sd_mode_pin != GPIO_NUM_NC) {
+        vTaskDelay(kAmpEnableDelay);
+        if (const esp_err_t ret = set_amp_enabled(impl.config, true); ret != ESP_OK) {
+            ESP_LOGE(TAG, "Cannot enable the amplifier via SD_MODE: %s", esp_err_to_name(ret));
+            return ret;
+        }
         ESP_LOGI(TAG, "Audio output enabled via SD_MODE (anti-pop complete).");
     }
 
-    ESP_LOGI(TAG, "AudioEngine started (mixer + SD reader tasks running).");
+    ESP_LOGI(TAG, "AudioEngine started (mixer and reader tasks running).");
     return ESP_OK;
 }
 
 
+
 ChannelId AudioEngine::prepare(std::string_view file_path, bool loop, uint16_t initial_volume) {
-    if (!_impl || !_impl->running) return INVALID_CHANNEL;
+    if (!_impl || !_impl->running.load(std::memory_order_acquire)) return INVALID_CHANNEL;
 
     ChannelId slot = INVALID_CHANNEL;
     for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-        if (_impl->channels[i] && _impl->channels[i]->claim()) {
+        if (_impl->channels[i].claim()) {
             slot = static_cast<ChannelId>(i);
             break;
         }
@@ -391,7 +462,7 @@ ChannelId AudioEngine::prepare(std::string_view file_path, bool loop, uint16_t i
         return INVALID_CHANNEL;
     }
 
-    esp_err_t ret = _impl->channels[slot]->load(file_path, loop, initial_volume);
+    esp_err_t ret = _impl->channels[slot].load(file_path, loop, initial_volume);
     if (ret != ESP_OK) {
         _impl->load_failures.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGE(TAG, "Failed to load: %.*s (err=%s)",
@@ -407,7 +478,7 @@ ChannelId AudioEngine::prepare(std::string_view file_path, bool loop, uint16_t i
 }
 
 esp_err_t AudioEngine::startGroup(std::span<const ChannelId> ids) {
-    if (!_impl || !_impl->channels || !_impl->running) return ESP_ERR_INVALID_STATE;
+    if (!_impl || !_impl->running.load(std::memory_order_acquire)) return ESP_ERR_INVALID_STATE;
     if (ids.empty() || ids.size() > _impl->config.max_channels) return ESP_ERR_INVALID_ARG;
 
     uint32_t members = 0;
@@ -433,9 +504,9 @@ esp_err_t AudioEngine::startGroup(std::span<const ChannelId> ids) {
     uint32_t armed = 0;
     for (uint32_t pending = members; pending != 0; pending &= pending - 1) {
         const int ch = std::countr_zero(pending);
-        if (!_impl->channels[ch]->arm(request)) {
+        if (!_impl->channels[ch].arm(request)) {
             for (uint32_t undo = armed; undo != 0; undo &= undo - 1) {
-                _impl->channels[std::countr_zero(undo)]->disarm(request);
+                _impl->channels[std::countr_zero(undo)].disarm(request);
             }
             _impl->requests_in_use.fetch_and(~(1U << request), std::memory_order_release);
             return ESP_ERR_INVALID_STATE;
@@ -459,8 +530,8 @@ AudioEngine::LinkedChannels AudioEngine::playLinked(std::string_view path_a, std
         return {};
     }
 
-    const uint32_t size_a = _impl->channels[first]->dataSize();
-    const uint32_t size_b = _impl->channels[second]->dataSize();
+    const uint32_t size_a = _impl->channels[first].dataSize();
+    const uint32_t size_b = _impl->channels[second].dataSize();
     if (size_a != size_b) {
         ESP_LOGW(TAG, "Linked files differ in length (%lu vs %lu bytes); loops will drift: %.*s, %.*s",
                  static_cast<unsigned long>(size_a), static_cast<unsigned long>(size_b),
@@ -496,7 +567,7 @@ ChannelId AudioEngine::play(std::string_view file_path, bool loop, uint16_t init
 void AudioEngine::stop(ChannelId id) {
     if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return;
 
-    _impl->channels[id]->requestStop();
+    _impl->channels[id].requestStop();
 
     ESP_LOGD(TAG, "Stopping channel %d (fade-out scheduled).", id);
 }
@@ -504,9 +575,7 @@ void AudioEngine::stop(ChannelId id) {
 void AudioEngine::setChannelVolume(ChannelId id, uint16_t target_volume) {
     if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return;
 
-    if (_impl->channels[id]) {
-        _impl->channels[id]->setTargetVolume(target_volume);
-    }
+    _impl->channels[id].setTargetVolume(target_volume);
 }
 
 void AudioEngine::setGlobalVolume(uint16_t target_volume) {
@@ -534,11 +603,10 @@ AudioEngine::Stats AudioEngine::getStats() {
     stats.no_free_channels = _impl->no_free_channels.load(std::memory_order_relaxed);
 
     for (uint8_t i = 0; i < _impl->config.max_channels; ++i) {
-        const AudioChannel* ch = _impl->channels[i];
-        if (!ch) continue;
-        stats.read_failures += ch->readFailures();
-        if (ch->state() != AudioChannel::State::Idle) ++stats.busy_channels;
-        if (ch->hasOpenFile()) ++stats.open_files;
+        const AudioChannel& ch = _impl->channels[i];
+        stats.read_failures += ch.readFailures();
+        if (ch.state() != AudioChannel::State::Idle) ++stats.busy_channels;
+        if (ch.hasOpenFile()) ++stats.open_files;
     }
     return stats;
 }
@@ -547,12 +615,11 @@ AudioEngine::ChannelInfo AudioEngine::channelInfo(ChannelId id) const {
     ChannelInfo info;
     if (!_impl || !_impl->channels || id < 0 || id >= _impl->config.max_channels) return info;
 
-    const AudioChannel* ch = _impl->channels[id];
-    if (!ch) return info;
-    info.state = static_cast<uint8_t>(ch->state());
-    info.group = ch->group();
-    info.start_cycle = ch->startCycle();
-    info.underruns = ch->underruns();
+    const AudioChannel& ch = _impl->channels[id];
+    info.state = static_cast<uint8_t>(ch.state());
+    info.group = ch.group();
+    info.start_cycle = ch.startCycle();
+    info.underruns = ch.underruns();
     return info;
 }
 

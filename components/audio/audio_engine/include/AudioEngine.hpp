@@ -3,6 +3,7 @@
 #include "esp_err.h"
 #include "hal/gpio_types.h" // IWYU pragma: keep
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 #include "DcBlocker.hpp"
@@ -14,6 +15,8 @@ using ChannelId = int8_t;
 
 /// Returned when channel allocation fails.
 constexpr ChannelId INVALID_CHANNEL = -1;
+
+struct AudioEngineImpl;
 
 /**
  * @brief Polyphonic audio engine for ESP32 with real-time mixing and I2S output.
@@ -70,6 +73,10 @@ public:
 
     /**
      * @brief Destroy the Audio Engine, stopping all tasks and freeing resources.
+     *
+     * Waits until every engine task has exited before anything is freed. If a task does
+     * not exit within its timeout, the engine resources are deliberately leaked (and an
+     * error is logged) rather than freed under a running task.
      */
     ~AudioEngine();
 
@@ -82,7 +89,12 @@ public:
      * Must be called before start(). Initializes the I2S transmitter
      * and allocates the channel array and mixer.
      *
-     * @return esp_err_t ESP_OK on success, ESP_ERR_INVALID_ARG if max_channels exceeds 32.
+     * Objects shared with the mixer are allocated in internal RAM; the per-channel ring
+     * buffers in PSRAM. On failure nothing is kept and init() may be called again.
+     *
+     * @return esp_err_t ESP_OK on success; ESP_ERR_INVALID_ARG if max_channels is 0 or
+     *         exceeds 32; ESP_ERR_INVALID_STATE if already initialized; ESP_ERR_NO_MEM if
+     *         internal RAM is exhausted; an I2S or GPIO error otherwise.
      */
     [[nodiscard]] esp_err_t init();
 
@@ -92,7 +104,10 @@ public:
      * After this call, the engine is actively outputting silence via I2S.
      * Use play() to begin audio playback on channels.
      *
-     * @return esp_err_t ESP_OK on success.
+     * @return esp_err_t ESP_OK on success; ESP_ERR_INVALID_STATE if not initialized or
+     *         already started; ESP_ERR_NO_MEM if a task cannot be created (the tasks
+     *         already created are stopped); a GPIO error if the SD_MODE pin cannot be
+     *         driven (the engine then runs with the amplifier still in shutdown).
      */
     [[nodiscard]] esp_err_t start();
 
@@ -257,8 +272,11 @@ public:
     ChannelInfo channelInfo(ChannelId id) const;
 
 private:
-    friend struct AudioEngineImpl;
-    struct AudioEngineImpl* _impl; ///< Opaque implementation (PIMPL)
+    struct ImplDeleter {
+        void operator()(AudioEngineImpl* impl) const;
+    };
+
+    std::unique_ptr<AudioEngineImpl, ImplDeleter> _impl; ///< Opaque implementation (PIMPL), internal RAM
 };
 
 } // namespace Espressif::Wrappers::Audio

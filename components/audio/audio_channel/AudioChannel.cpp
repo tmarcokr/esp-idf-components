@@ -8,19 +8,32 @@ namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioChannel";
 
+static constexpr uint32_t kRingBufferCaps = MALLOC_CAP_SPIRAM;
+
 static constexpr uint32_t toStatus(AudioChannel::State state) {
     return static_cast<uint32_t>(state);
 }
 
 
+void AudioChannel::RingBufferFree::operator()(int16_t* samples) const {
+    heap_caps_free(samples);
+}
+
+AudioChannel::RingBuffer AudioChannel::allocateRingBuffer() {
+    RingBuffer ring(static_cast<int16_t*>(heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), kRingBufferCaps)));
+    if (!ring) {
+        ESP_LOGE(TAG, "Failed to allocate the %zu-sample ring buffer (caps 0x%lx).",
+                 RING_BUFFER_SAMPLES, static_cast<unsigned long>(kRingBufferCaps));
+    }
+    return ring;
+}
+
 AudioChannel::AudioChannel()
     : _status(toStatus(State::Idle)),
       _loop_enabled(false),
-      _file(nullptr),
       _wav_header{},
       _file_position(0),
-      _ring_buffer(static_cast<int16_t*>(
-          heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM))),
+      _ring_buffer(allocateRingBuffer()),
       _write_index(0),
       _read_index(0),
       _eof(false),
@@ -37,19 +50,10 @@ AudioChannel::AudioChannel()
       _mix_read(0),
       _mix_write(0),
       _mix_target(0),
-      _mix_underruns(0) {
-    if (!_ring_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate %zu-sample ring buffer in PSRAM.",
-                 RING_BUFFER_SAMPLES);
-    }
-}
+      _mix_underruns(0) {}
 
 AudioChannel::~AudioChannel() {
     release();
-    if (_ring_buffer) {
-        heap_caps_free(_ring_buffer);
-        _ring_buffer = nullptr;
-    }
 }
 
 
@@ -89,7 +93,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     _file_path.assign(path);
     const bool memory_backed = (_file_path.rfind("/mem/", 0) == 0);
 
-    _file = fopen(_file_path.c_str(), "rb");
+    _file.reset(fopen(_file_path.c_str(), "rb"));
     if (!_file) {
         ESP_LOGE(TAG, "Failed to open file: %s", _file_path.c_str());
         abortLoad();
@@ -97,7 +101,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     }
     _file_open.store(true, std::memory_order_release);
 
-    esp_err_t ret = parseWavHeader(_file, _wav_header);
+    esp_err_t ret = parseWavHeader(_file.get(), _wav_header);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Invalid WAV header in: %s", _file_path.c_str());
         abortLoad();
@@ -132,8 +136,6 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     _target_volume.store(volume);
     _current_volume = volume;
 
-    fseek(_file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
-
     // Pre-fill the ring buffer (leave 1 slot empty to distinguish full from empty).
     // Reads start at index 0 and never exceed capacity, so this is contiguous —
     // read straight into the ring, no temp buffer / no wrap handling needed here.
@@ -143,7 +145,15 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     const size_t prefill_target = memory_backed ? (RING_BUFFER_SAMPLES - 1)
                                                 : INITIAL_PREFILL_SAMPLES;
     bool eof = false;
-    const size_t filled = readFromFile(_ring_buffer, prefill_target, eof);
+    size_t filled = 0;
+    if (seekToData(_file.get())) {
+        filled = readFromFile(_ring_buffer.get(), prefill_target, eof);
+    } else if (_loop_enabled) {
+        // Trick: "at the end of the data" makes the reader retry the seek through the loop wrap.
+        _file_position = _wav_header.data_size;
+    } else {
+        eof = true;
+    }
     _read_index.store(0, std::memory_order_release);
     _write_index.store(filled, std::memory_order_release);
     _eof.store(eof, std::memory_order_release);
@@ -169,10 +179,18 @@ void AudioChannel::abortLoad() {
 
 void AudioChannel::closeFile() {
     if (_file) {
-        fclose(_file);
-        _file = nullptr;
+        _file.reset();
         _file_open.store(false, std::memory_order_release);
     }
+}
+
+bool AudioChannel::seekToData(FILE* file) {
+    if (fseek(file, static_cast<long>(_wav_header.data_offset), SEEK_SET) != 0) {
+        _read_failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    _file_position = 0;
+    return true;
 }
 
 void AudioChannel::release() {
@@ -446,11 +464,11 @@ size_t AudioChannel::refillBuffer() {
     // contiguous reads when the target region wraps past the end of the buffer.
     bool eof = false;
     size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - write);
-    size_t total_read = readFromFile(_ring_buffer + write, contiguous, eof);
+    size_t total_read = readFromFile(_ring_buffer.get() + write, contiguous, eof);
     write = (write + total_read) % RING_BUFFER_SAMPLES;
 
     if (total_read == contiguous && to_read > contiguous && !eof) {
-        const size_t second = readFromFile(_ring_buffer + write, to_read - contiguous, eof);
+        const size_t second = readFromFile(_ring_buffer.get() + write, to_read - contiguous, eof);
         write = (write + second) % RING_BUFFER_SAMPLES;
         total_read += second;
     }
@@ -475,7 +493,7 @@ bool AudioChannel::closeIfClosing(bool memory_reader) {
 
 
 size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool& eof) {
-    FILE* const file = _file;
+    FILE* const file = _file.get();
     if (!file || samples_requested == 0) return 0;
 
     size_t total_read = 0;
@@ -490,8 +508,7 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool&
                 eof = true;
                 break;
             }
-            fseek(file, static_cast<long>(_wav_header.data_offset), SEEK_SET);
-            _file_position = 0;
+            if (!seekToData(file)) break;
             bytes_remaining = _wav_header.data_size;
         }
 
@@ -518,7 +535,7 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool&
 esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
     if (!file) return ESP_ERR_INVALID_ARG;
 
-    fseek(file, 0, SEEK_SET);
+    if (fseek(file, 0, SEEK_SET) != 0) return ESP_FAIL;
 
     // --- RIFF header ---
     char riff_id[4];
@@ -566,7 +583,7 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
 
             // Skip any extra fmt bytes
             long extra = static_cast<long>(chunk_size) - 16;
-            if (extra > 0) fseek(file, extra, SEEK_CUR);
+            if (extra > 0 && fseek(file, extra, SEEK_CUR) != 0) return ESP_FAIL;
 
             // Validate constraints
             if (header.num_channels != 1) {
@@ -587,14 +604,15 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
             found_fmt = true;
 
         } else if (std::memcmp(chunk_id, "data", 4) == 0) {
-            header.data_offset = static_cast<uint32_t>(ftell(file));
+            const long data_offset = ftell(file);
+            if (data_offset < 0) return ESP_FAIL;
+            header.data_offset = static_cast<uint32_t>(data_offset);
             header.data_size = chunk_size;
             found_data = true;
             // Don't skip — caller will seek to data_offset
 
         } else {
-            // Unknown chunk — skip it
-            fseek(file, static_cast<long>(chunk_size), SEEK_CUR);
+            if (fseek(file, static_cast<long>(chunk_size), SEEK_CUR) != 0) return ESP_FAIL;
         }
     }
 

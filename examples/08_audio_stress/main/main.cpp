@@ -105,6 +105,10 @@ constexpr uint32_t kStartCheckTicks = 20;
 constexpr uint8_t kStateReady = 2;
 constexpr uint8_t kStateActive = 3;
 
+constexpr int kLifecycleCycles = 20;
+constexpr uint32_t kLifecyclePlayMs = 50;
+constexpr size_t kHeapLeakToleranceBytes = 1024;
+
 constexpr uint32_t kPairIdleBit = 1U << 0;
 constexpr uint32_t kShotIdleBit = 1U << 1;
 constexpr uint32_t kAllIdleBits = kPairIdleBit | kShotIdleBit;
@@ -677,6 +681,99 @@ bool allChannelsReusable(AudioEngine& engine) {
     return reusable;
 }
 
+AudioEngine::Config engineConfig(gpio_num_t sd_mode_pin) {
+    return {
+        .bclk_pin = BoardPins::kI2sBclk,
+        .ws_pin = BoardPins::kI2sWs,
+        .dout_pin = BoardPins::kI2sDout,
+        .sd_mode_pin = sd_mode_pin,
+        .max_channels = CONFIG_STRESS_MAX_CHANNELS,
+    };
+}
+
+bool runEngineStress() {
+    AudioEngine engine(engineConfig(BoardPins::kAmpSdMode));
+    if (const esp_err_t err = engine.init(); err != ESP_OK) {
+        ESP_LOGE(TAG, "Audio engine init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (const esp_err_t err = engine.start(); err != ESP_OK) {
+        ESP_LOGE(TAG, "Audio engine start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    const RunResult result = runWorkers(engine);
+    vTaskDelay(pdMS_TO_TICKS(kLongestShotMs + kQuiesceSettleMs));
+    const bool reusable = allChannelsReusable(engine);
+    const bool pass = result.completed && reusable && (!kLinkedStart || result.aligned);
+    if (pass) {
+        ESP_LOGI(TAG, "Stress check: PASS");
+    } else {
+        ESP_LOGE(TAG, "Stress check: FAIL");
+    }
+    return pass;
+}
+
+struct FreeHeap {
+    size_t internal;
+    size_t psram;
+};
+
+FreeHeap freeHeap() {
+    return {
+        .internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        .psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+    };
+}
+
+bool withinLeakTolerance(size_t before, size_t after) {
+    return after + kHeapLeakToleranceBytes >= before;
+}
+
+bool cycleEngine() {
+    AudioEngine engine(engineConfig(GPIO_NUM_NC));
+    if (const esp_err_t err = engine.init(); err != ESP_OK) {
+        ESP_LOGE(TAG, "Lifecycle: init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (const esp_err_t err = engine.start(); err != ESP_OK) {
+        ESP_LOGE(TAG, "Lifecycle: start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    const ChannelId id = engine.play(kLoopAPath, true, 0);
+    vTaskDelay(pdMS_TO_TICKS(kLifecyclePlayMs));
+    if (id == INVALID_CHANNEL) {
+        ESP_LOGE(TAG, "Lifecycle: play failed");
+        return false;
+    }
+    return true;
+}
+
+// Warning: the stress engine must be destroyed before this runs; both use the same I2S pins.
+bool engineLifecycleStable() {
+    if (!cycleEngine()) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(kQuiesceSettleMs));
+    const FreeHeap before = freeHeap();
+
+    for (int cycle = 0; cycle < kLifecycleCycles; ++cycle) {
+        if (!cycleEngine()) {
+            return false;
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(kQuiesceSettleMs));
+    const FreeHeap after = freeHeap();
+
+    const bool stable =
+        withinLeakTolerance(before.internal, after.internal) && withinLeakTolerance(before.psram, after.psram);
+    ESP_LOGI(TAG, "Lifecycle x%d: free heap int %u -> %u, psram %u -> %u (tolerance %u B): %s", kLifecycleCycles,
+             static_cast<unsigned>(before.internal), static_cast<unsigned>(after.internal),
+             static_cast<unsigned>(before.psram), static_cast<unsigned>(after.psram),
+             static_cast<unsigned>(kHeapLeakToleranceBytes), stable ? "PASS" : "FAIL");
+    return stable;
+}
+
 void runStress() {
     SdCard sd({
         .mode = SdCard::HostMode::SDMMC_1BIT,
@@ -697,27 +794,10 @@ void runStress() {
         return;
     }
 
-    AudioEngine engine({
-        .bclk_pin = BoardPins::kI2sBclk,
-        .ws_pin = BoardPins::kI2sWs,
-        .dout_pin = BoardPins::kI2sDout,
-        .sd_mode_pin = BoardPins::kAmpSdMode,
-        .max_channels = CONFIG_STRESS_MAX_CHANNELS,
-    });
-    if (const esp_err_t err = engine.init(); err != ESP_OK) {
-        ESP_LOGE(TAG, "Audio engine init failed: %s", esp_err_to_name(err));
-        return;
-    }
-    if (const esp_err_t err = engine.start(); err != ESP_OK) {
-        ESP_LOGE(TAG, "Audio engine start failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    const RunResult result = runWorkers(engine);
-    vTaskDelay(pdMS_TO_TICKS(kLongestShotMs + kQuiesceSettleMs));
-    const bool reusable = allChannelsReusable(engine);
-    const bool pass = result.completed && reusable && (!kLinkedStart || result.aligned);
-    if (pass) {
+    const bool stress_ok = runEngineStress();
+    vTaskDelay(pdMS_TO_TICKS(kQuiesceSettleMs));
+    const bool lifecycle_ok = engineLifecycleStable();
+    if (stress_ok && lifecycle_ok) {
         ESP_LOGI(TAG, "PASS");
     } else {
         ESP_LOGE(TAG, "FAIL");
