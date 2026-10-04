@@ -5,9 +5,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <type_traits>
 
+using Espressif::Wrappers::Audio::BasicDynamicRangeCompressor;
 using Espressif::Wrappers::Audio::DynamicRangeCompressor;
+using Espressif::Wrappers::Audio::EnvelopeRoot;
+using Espressif::Wrappers::Audio::kNativeEnvelopeRoot;
+using Espressif::Wrappers::Audio::squareRootFloor;
 
 namespace {
 
@@ -18,6 +24,18 @@ constexpr int kBurstLength = 2500;
 constexpr int kVolumeChangePeriod = 1000;
 constexpr int kVolumeChangeSamples = 200000;
 constexpr int kBoundaryNoiseAmplitude = 3000;
+constexpr uint32_t kExhaustiveRootLimit = 1U << 22;
+constexpr uint32_t kRootEqualityLimit = 1U << 20;
+constexpr int kRandomRootSamples = 10000000;
+constexpr int kMaxIntegerError = 16;
+constexpr double kMaxIntegerRmsError = 0.5;
+
+using FloatCompressor = BasicDynamicRangeCompressor<EnvelopeRoot::Float>;
+using IntegerCompressor = BasicDynamicRangeCompressor<EnvelopeRoot::Integer>;
+
+static_assert(std::is_same_v<DynamicRangeCompressor, BasicDynamicRangeCompressor<kNativeEnvelopeRoot>>);
+static_assert(squareRootFloor(0) == 0 && squareRootFloor(3) == 1 && squareRootFloor(4) == 2);
+static_assert(squareRootFloor(UINT32_MAX) == 65535);
 
 constexpr std::array<int32_t, 9> kVolumes = {0, 1, 100, 600, 800, 1000, 2000, 13107, 65535};
 constexpr std::array<int32_t, 6> kAmplitudes = {100, 3000, 32767, 300000, 1 << 20, (1 << 22) - 1};
@@ -112,31 +130,95 @@ private:
 
 class Tally {
 public:
-    void compare(DynamicRangeCompressor& compressor, ReferenceCompressor& reference, int32_t x, int32_t volume,
-                 int index, const char* context) {
+    virtual ~Tally() = default;
+
+    void beginRun(const char* context) {
+        std::snprintf(_context, sizeof(_context), "%s", context);
+        _run_max = 0;
+        _run_squares = 0;
+        _run_samples = 0;
+    }
+
+    void record(int16_t actual, int16_t expected, int32_t x, int32_t volume, int index) {
         ++_samples;
+        ++_run_samples;
         if (static_cast<int64_t>(x) * volume != static_cast<int32_t>(static_cast<int64_t>(x) * volume)) {
             ++_wide_products;
         }
-        const int16_t actual = compressor.process(x);
-        const int16_t expected = reference.process(x);
-        if (actual == expected) return;
-        if (_mismatches++ < kMaxReports) {
-            std::printf("FAIL %s index %d: got %d, reference %d\n", context, index, actual, expected);
-        }
+        const int error = std::abs(static_cast<int>(actual) - static_cast<int>(expected));
+        if (error == 0) return;
+        ++_mismatches;
+        _run_squares += static_cast<double>(error) * error;
+        if (error > _run_max) _run_max = error;
+        onMismatch(actual, expected, index);
     }
+
+    virtual void endRun() {}
 
     uint64_t samples() const { return _samples; }
     uint64_t wideProducts() const { return _wide_products; }
     uint64_t mismatches() const { return _mismatches; }
 
-private:
+protected:
     static constexpr int kMaxReports = 20;
+
+    virtual void onMismatch(int16_t, int16_t, int) {}
+
+    char _context[96] = {};
+    int _run_max = 0;
+    double _run_squares = 0;
+    uint64_t _run_samples = 0;
     uint64_t _samples = 0;
     uint64_t _wide_products = 0;
     uint64_t _mismatches = 0;
 };
 
+class ExactTally : public Tally {
+public:
+    bool passed() const { return _mismatches == 0; }
+
+private:
+    void onMismatch(int16_t actual, int16_t expected, int index) override {
+        if (_mismatches <= kMaxReports) {
+            std::printf("FAIL %s index %d: got %d, reference %d\n", _context, index, actual, expected);
+        }
+    }
+};
+
+class ToleranceTally : public Tally {
+public:
+    void endRun() override {
+        const double rms = (_run_samples == 0) ? 0 : std::sqrt(_run_squares / static_cast<double>(_run_samples));
+        if (_run_max > _worst_max) {
+            _worst_max = _run_max;
+            std::snprintf(_worst_max_context, sizeof(_worst_max_context), "%s", _context);
+        }
+        if (rms > _worst_rms) {
+            _worst_rms = rms;
+            std::snprintf(_worst_rms_context, sizeof(_worst_rms_context), "%s", _context);
+        }
+        if (_run_max > kMaxIntegerError || rms > kMaxIntegerRmsError) {
+            if (_failed_runs++ < kMaxReports) {
+                std::printf("FAIL %s: max error %d LSB, RMS %.4f LSB\n", _context, _run_max, rms);
+            }
+        }
+    }
+
+    bool passed() const { return _failed_runs == 0; }
+    int worstMax() const { return _worst_max; }
+    double worstRms() const { return _worst_rms; }
+    const char* worstMaxContext() const { return _worst_max_context; }
+    const char* worstRmsContext() const { return _worst_rms_context; }
+
+private:
+    int _failed_runs = 0;
+    int _worst_max = 0;
+    double _worst_rms = 0;
+    char _worst_max_context[96] = "none";
+    char _worst_rms_context[96] = "none";
+};
+
+template <typename Compressor>
 void checkSignals(Tally& tally) {
     char context[96];
     for (const int32_t volume : kVolumes) {
@@ -144,13 +226,15 @@ void checkSignals(Tally& tally) {
             for (const int32_t amplitude : kAmplitudes) {
                 std::snprintf(context, sizeof(context), "volume %" PRId32 " %s amplitude %" PRId32, volume,
                               signalName(signal), amplitude);
-                DynamicRangeCompressor compressor(volume);
+                tally.beginRun(context);
+                Compressor compressor(volume);
                 ReferenceCompressor reference(volume);
                 SignalSource source(signal, amplitude);
                 for (int i = 0; i < kSamplesPerRun; ++i) {
                     const int32_t x = source.sample(i);
-                    tally.compare(compressor, reference, x, volume, i, context);
+                    tally.record(compressor.process(x), reference.process(x), x, volume, i);
                 }
+                tally.endRun();
             }
         }
     }
@@ -171,25 +255,30 @@ int boundaryInputs(int32_t volume, std::array<int32_t, 12>& inputs) {
     return count;
 }
 
+template <typename Compressor>
 void checkOverflowBoundary(Tally& tally) {
     char context[96];
     for (const int32_t volume : kVolumes) {
         if (volume == 0) continue;
         std::snprintf(context, sizeof(context), "boundary volume %" PRId32, volume);
+        tally.beginRun(context);
         std::array<int32_t, 12> inputs{};
         const int count = boundaryInputs(volume, inputs);
-        DynamicRangeCompressor compressor(volume);
+        Compressor compressor(volume);
         ReferenceCompressor reference(volume);
         Xorshift noise(0x9E3779B9U);
         for (int i = 0; i < kSamplesPerRun; ++i) {
             const int32_t x = (i % 2 == 0) ? noise.nextIn(kBoundaryNoiseAmplitude) : inputs[(i / 2) % count];
-            tally.compare(compressor, reference, x, volume, i, context);
+            tally.record(compressor.process(x), reference.process(x), x, volume, i);
         }
+        tally.endRun();
     }
 }
 
+template <typename Compressor>
 void checkVolumeChanges(Tally& tally) {
-    DynamicRangeCompressor compressor(kVolumes[0]);
+    tally.beginRun("volume changes");
+    Compressor compressor(kVolumes[0]);
     ReferenceCompressor reference(kVolumes[0]);
     Xorshift noise(0xC0FFEE11U);
     size_t volume_index = 0;
@@ -201,8 +290,75 @@ void checkVolumeChanges(Tally& tally) {
         }
         const int32_t amplitude = kAmplitudes[(i / (kVolumeChangePeriod * kVolumes.size())) % kAmplitudes.size()];
         const int32_t x = noise.nextIn(amplitude);
-        tally.compare(compressor, reference, x, kVolumes[volume_index], i, "volume changes");
+        tally.record(compressor.process(x), reference.process(x), x, kVolumes[volume_index], i);
     }
+    tally.endRun();
+}
+
+template <typename Compressor>
+void checkAll(Tally& tally) {
+    checkSignals<Compressor>(tally);
+    checkOverflowBoundary<Compressor>(tally);
+    checkVolumeChanges<Compressor>(tally);
+}
+
+class RootCheck {
+public:
+    void check(uint32_t x) {
+        ++_values;
+        const uint32_t root = squareRootFloor(x);
+        const uint64_t r = root;
+        if (r * r > x || (r + 1) * (r + 1) <= x) {
+            if (_floor_failures++ < 20) std::printf("FAIL squareRootFloor(%" PRIu32 ") = %" PRIu32 "\n", x, root);
+        }
+
+        const auto float_root = static_cast<uint32_t>(std::sqrt(static_cast<float>(x)));
+        const uint32_t difference = (root > float_root) ? root - float_root : float_root - root;
+        if (difference > 1) {
+            if (_agreement_failures++ < 20) {
+                std::printf("FAIL root agreement at %" PRIu32 ": integer %" PRIu32 ", float %" PRIu32 "\n", x, root,
+                            float_root);
+            }
+        }
+        if (difference != 0 && x < _smallest_difference) _smallest_difference = x;
+    }
+
+    bool passed() const {
+        return _floor_failures == 0 && _agreement_failures == 0 && _smallest_difference >= kRootEqualityLimit;
+    }
+
+    void report() const {
+        std::printf("compressor_test: squareRootFloor checked on %" PRIu64 " values, %d floor errors, %d roots more "
+                    "than 1 from sqrtf; smallest x where they differ: ",
+                    _values, _floor_failures, _agreement_failures);
+        if (_smallest_difference == UINT32_MAX) {
+            std::printf("none\n");
+        } else {
+            std::printf("%" PRIu32 " (must be >= %" PRIu32 ")\n", _smallest_difference, kRootEqualityLimit);
+        }
+    }
+
+private:
+    uint64_t _values = 0;
+    int _floor_failures = 0;
+    int _agreement_failures = 0;
+    uint32_t _smallest_difference = UINT32_MAX;
+};
+
+bool checkSquareRoot() {
+    RootCheck roots;
+    for (uint32_t x = 0; x < kExhaustiveRootLimit; ++x) roots.check(x);
+    for (uint32_t k = 0; k <= 65535; ++k) {
+        const uint32_t square = k * k;
+        if (k != 0) roots.check(square - 1);
+        roots.check(square);
+        if (square != UINT32_MAX) roots.check(square + 1);
+    }
+    roots.check(UINT32_MAX);
+    Xorshift random(0x5EED1234U);
+    for (int i = 0; i < kRandomRootSamples; ++i) roots.check(random.next());
+    roots.report();
+    return roots.passed();
 }
 
 static_assert(kAmplitudes.back() < (1 << 24), "signal inputs stay below 2^24");
@@ -210,15 +366,26 @@ static_assert(kAmplitudes.back() < (1 << 24), "signal inputs stay below 2^24");
 }  // namespace
 
 int main() {
-    Tally tally;
-    checkSignals(tally);
-    checkOverflowBoundary(tally);
-    checkVolumeChanges(tally);
+    ExactTally float_tally;
+    checkAll<FloatCompressor>(float_tally);
+    std::printf("compressor_test: float root: %" PRIu64 " samples compared (%" PRIu64
+                " with v * volume beyond 32 bits), %" PRIu64 " mismatches\n",
+                float_tally.samples(), float_tally.wideProducts(), float_tally.mismatches());
 
-    std::printf("compressor_test: %" PRIu64 " samples compared (%" PRIu64 " with v * volume beyond 32 bits), %" PRIu64
-                " mismatches\n",
-                tally.samples(), tally.wideProducts(), tally.mismatches());
-    if (tally.mismatches() != 0) {
+    const bool roots_passed = checkSquareRoot();
+
+    ToleranceTally integer_tally;
+    checkAll<IntegerCompressor>(integer_tally);
+    std::printf("compressor_test: integer root: %" PRIu64 " samples compared, %" PRIu64
+                " differ; worst max error %d LSB (%s), worst RMS %.4f LSB (%s); bounds %d LSB, %.1f LSB RMS\n",
+                integer_tally.samples(), integer_tally.mismatches(), integer_tally.worstMax(),
+                integer_tally.worstMaxContext(), integer_tally.worstRms(), integer_tally.worstRmsContext(),
+                kMaxIntegerError, kMaxIntegerRmsError);
+
+    std::printf("compressor_test: native root: %s\n",
+                kNativeEnvelopeRoot == EnvelopeRoot::Float ? "float" : "integer");
+
+    if (!float_tally.passed() || !roots_passed || !integer_tally.passed()) {
         std::printf("compressor_test: FAIL\n");
         return 1;
     }

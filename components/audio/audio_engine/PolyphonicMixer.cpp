@@ -1,10 +1,20 @@
 #include "PolyphonicMixer.hpp"
 #include "AudioChannel.hpp"
+#include "soc/soc_caps.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
 
 namespace Espressif::Wrappers::Audio {
+
+#if defined(SOC_CPU_HAS_FPU) && SOC_CPU_HAS_FPU
+static constexpr bool kSocHasFpu = true;
+#else
+static constexpr bool kSocHasFpu = false;
+#endif
+
+static_assert((kNativeEnvelopeRoot == EnvelopeRoot::Float) == kSocHasFpu,
+              "the compressor root chosen from the compiler macros must match SOC_CPU_HAS_FPU");
 
 static void publish_max(std::atomic<int32_t>& target, int32_t value) {
     int32_t current = target.load(std::memory_order_relaxed);

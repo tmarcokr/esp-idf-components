@@ -7,6 +7,44 @@
 namespace Espressif::Wrappers::Audio {
 
 /**
+ * @brief How the compressor takes the square root of its envelope.
+ */
+enum class EnvelopeRoot : uint8_t {
+    Float,    ///< (int)sqrtf((float)x); bit-exact with the original compressor.
+    Integer,  ///< squareRootFloor(); differs from Float by at most 1, only for envelopes above about 2^22.
+};
+
+#if defined(__XTENSA_SOFT_FLOAT__) || defined(__riscv_float_abi_soft)
+/// Root used by DynamicRangeCompressor: Integer on targets without an FPU.
+inline constexpr EnvelopeRoot kNativeEnvelopeRoot = EnvelopeRoot::Integer;
+#else
+/// Root used by DynamicRangeCompressor: Float on targets with an FPU.
+inline constexpr EnvelopeRoot kNativeEnvelopeRoot = EnvelopeRoot::Float;
+#endif
+
+/**
+ * @brief Exact integer square root, floor(sqrt(x)), in constant time without division.
+ * @param x Value.
+ * @return The largest r with r * r <= x.
+ */
+inline constexpr uint32_t squareRootFloor(uint32_t x) {
+    // Trick: digit-by-digit (bit-pair) method; each of the 16 steps fixes one bit of the root,
+    // a fixed count instead of skipping leading zero pairs, so the time does not depend on x.
+    uint32_t root = 0;
+    uint32_t bit = 1U << 30;
+    for (int step = 0; step < 16; ++step) {
+        const uint32_t trial = root + bit;
+        root >>= 1;
+        if (x >= trial) {
+            x -= trial;
+            root += bit;
+        }
+        bit >>= 2;
+    }
+    return root;
+}
+
+/**
  * @brief Square-root-law auto-gain compressor for dynamic range control.
  *
  * Maintains a leaky running average of the rectified input signal envelope
@@ -17,14 +55,18 @@ namespace Espressif::Wrappers::Audio {
  *
  * Transients are dynamically compressed before the final output clamping
  * to prevent digital clipping and mechanical speaker distortion.
+ *
+ * @tparam Root Square root of the envelope; use the DynamicRangeCompressor alias, which picks
+ *         the float root on targets with an FPU and the integer root otherwise.
  */
-class DynamicRangeCompressor {
+template <EnvelopeRoot Root>
+class BasicDynamicRangeCompressor {
 public:
     /**
      * @brief Construct a new Dynamic Range Compressor.
      * @param volume Target threshold volume for gain compression.
      */
-    explicit DynamicRangeCompressor(int32_t volume = kDefaultVolume)
+    explicit BasicDynamicRangeCompressor(int32_t volume = kDefaultVolume)
         : _volume(volume), _vol_avg(0) {}
 
     /**
@@ -39,9 +81,14 @@ public:
 
         const int32_t volume = _volume.load(std::memory_order_relaxed);
 
-        // Square-root-law gain reduction. sqrtf runs on the FPU where the target has one and in
-        // software otherwise (e.g. ESP32-C6).
-        int32_t divisor = static_cast<int32_t>(std::sqrt(static_cast<float>(_vol_avg))) + 100;
+        // Square-root-law gain reduction. sqrtf would run in software without an FPU, so those
+        // targets use the exact integer root instead.
+        int32_t divisor;
+        if constexpr (Root == EnvelopeRoot::Float) {
+            divisor = static_cast<int32_t>(std::sqrt(static_cast<float>(_vol_avg))) + 100;
+        } else {
+            divisor = static_cast<int32_t>(squareRootFloor(_vol_avg)) + 100;
+        }
 
         // Cap gain at unity. The mixer must only attenuate loud passages to
         // prevent clipping, never amplify them. Since gain = volume / divisor,
@@ -96,5 +143,10 @@ private:
     std::atomic<int32_t> _volume;
     uint32_t _vol_avg;
 };
+
+/**
+ * @brief The compressor with the native envelope root of the target (see kNativeEnvelopeRoot).
+ */
+using DynamicRangeCompressor = BasicDynamicRangeCompressor<kNativeEnvelopeRoot>;
 
 } // namespace Espressif::Wrappers::Audio
