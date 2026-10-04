@@ -30,7 +30,7 @@ static constexpr TaskSpec kMixerTask{"audio_mixer", 4096, 10};
 static constexpr TaskSpec kMemReaderTask{"audio_mem_reader", 4096, 9};
 static constexpr TaskSpec kSdReaderTask{"audio_sd_reader", 8192, 6};
 
-#if CONFIG_IDF_TARGET_ESP32S3
+#if !CONFIG_FREERTOS_UNICORE && portNUM_PROCESSORS > 1
 static constexpr BaseType_t kAudioCore = 1;
 #else
 static constexpr BaseType_t kAudioCore = tskNO_AFFINITY;
