@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 
@@ -36,9 +37,10 @@ public:
         _vol_avg += static_cast<uint32_t>(v < 0 ? -v : v);
         _vol_avg -= (_vol_avg + 255) >> 8;
 
-        const int32_t volume = _volume;
+        const int32_t volume = _volume.load(std::memory_order_relaxed);
 
-        // Square-root-law gain reduction. float sqrt is fine on ESP32 (FPU).
+        // Square-root-law gain reduction. sqrtf runs on the FPU where the target has one and in
+        // software otherwise (e.g. ESP32-C6).
         int32_t divisor = static_cast<int32_t>(std::sqrt(static_cast<float>(_vol_avg))) + 100;
 
         // Cap gain at unity. The mixer must only attenuate loud passages to
@@ -58,18 +60,24 @@ public:
 
     /**
      * @brief Set the compression volume parameter.
+     *
+     * Safe to call from any task while another task runs process() (lock-free atomic store).
+     *
      * @param volume Target volume threshold.
      */
-    void setVolume(int32_t volume) { _volume = volume; }
+    void setVolume(int32_t volume) { _volume.store(volume, std::memory_order_relaxed); }
 
     /**
-     * @brief Get the current compression volume parameter.
+     * @brief Get the current compression volume parameter; callable from any task.
      * @return Volume threshold.
      */
-    int32_t volume() const { return _volume; }
+    int32_t volume() const { return _volume.load(std::memory_order_relaxed); }
 
     /**
      * @brief Get the running average rectified volume envelope.
+     *
+     * Not synchronized: call it only from the task that calls process().
+     *
      * @return Running average envelope level.
      */
     uint32_t averageVolume() const { return _vol_avg; }
@@ -84,7 +92,8 @@ private:
         return static_cast<int16_t>(x);
     }
 
-    int32_t _volume;
+    // Relaxed is enough: no other data is published or read through the volume.
+    std::atomic<int32_t> _volume;
     uint32_t _vol_avg;
 };
 
