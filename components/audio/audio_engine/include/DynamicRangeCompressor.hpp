@@ -36,15 +36,22 @@ public:
         _vol_avg += static_cast<uint32_t>(v < 0 ? -v : v);
         _vol_avg -= (_vol_avg + 255) >> 8;
 
+        const int32_t volume = _volume;
+
         // Square-root-law gain reduction. float sqrt is fine on ESP32 (FPU).
         int32_t divisor = static_cast<int32_t>(std::sqrt(static_cast<float>(_vol_avg))) + 100;
 
         // Cap gain at unity. The mixer must only attenuate loud passages to
         // prevent clipping, never amplify them. Since gain = volume / divisor,
         // capping gain <= 1 means divisor >= volume.
-        if (divisor < _volume) divisor = _volume;
+        if (divisor < volume) divisor = volume;
 
-        int32_t out = static_cast<int32_t>((static_cast<int64_t>(v) * _volume) / divisor);
+        // Trick: v * volume nearly always fits in 32 bits; the 32-bit division is a single hardware
+        // instruction, the 64-bit one a __divdi3 libcall. Both truncate toward zero, so the result is identical.
+        int32_t product;
+        const int32_t out = __builtin_mul_overflow(v, volume, &product)
+            ? static_cast<int32_t>((static_cast<int64_t>(v) * volume) / divisor)
+            : product / divisor;
 
         return clampToInt16(out);
     }
