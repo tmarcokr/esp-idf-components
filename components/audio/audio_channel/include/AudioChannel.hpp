@@ -1,5 +1,6 @@
 #pragma once
 
+#include "RingGeometry.hpp"
 #include "esp_err.h"
 #include <atomic>
 #include <cstdint>
@@ -285,7 +286,7 @@ public:
      * Lets the reader service the most-starved channel first so a slow
      * read on one channel can't push another into underrun.
      *
-     * @return Unread samples in the ring buffer (0..RING_BUFFER_SAMPLES-1).
+     * @return Unread samples in the ring buffer (0 to the ring size - 1).
      */
     size_t bufferedSamples() const { return availableSamples(); }
 
@@ -294,8 +295,8 @@ public:
      *
      * Must be called only by the reader that owns the channel (see isOwnedBy()).
      * Read failures are counted (see readFailures()), not logged.
-     * Reads up to MAX_SD_CHUNK_SAMPLES from the current file position and handles
-     * EOF looping internally. Stops early if the channel moves to Closing. When a
+     * Reads up to one chunk (a quarter of the ring) from the current file position and
+     * handles EOF looping internally. Stops early if the channel moves to Closing. When a
      * one-shot reaches the end of its data (or a read fails), the end is published
      * and the file is closed at once.
      *
@@ -312,27 +313,6 @@ public:
     bool closeIfClosing(bool memory_reader);
 
 private:
-    /// Ring buffer capacity in samples (16384 samples = 32KB @ 16-bit, ~371ms).
-    /// Large slack absorbs SD-reader stalls on big files (magnetic profile).
-    /// Allocated in PSRAM (not internal RAM) — see allocateRingBuffer().
-    static constexpr size_t RING_BUFFER_SAMPLES = 16384;
-
-    /// Watermark threshold: refill when available samples drop below this.
-    static constexpr size_t REFILL_WATERMARK = 8192;
-
-    /// Max samples per single SD read (4096 = ~93ms). Caps how long one
-    /// refillBuffer() holds the FATFS lock so the SD reader yields frequently
-    /// and can interleave other starved SD channels between chunks. Sized so
-    /// the reader can keep a long SD sound (e.g. a 2s retraction) topped up
-    /// even while sharing time with a concurrent heavy read.
-    static constexpr size_t MAX_SD_CHUNK_SAMPLES = 4096;
-
-    /// Initial samples pre-loaded for SD-backed files at load() time (~93ms).
-    /// Kept small so triggering a sound (e.g., a sudden loud effect) holds the SD
-    /// lock only briefly; the reader task tops the ring up afterwards.
-    /// Memory-backed files ignore this and pre-fill the whole ring (memcpy).
-    static constexpr size_t INITIAL_PREFILL_SAMPLES = 4096;
-
     /// Volume precision: 14-bit (0–16384).
     static constexpr uint16_t MAX_VOLUME = 16384;
 
@@ -370,7 +350,9 @@ private:
     uint32_t _file_position;        ///< Current read position in data section (bytes)
 
     // --- Ring Buffer (allocated in PSRAM) ---
-    RingBuffer _ring_buffer;            ///< PSRAM-backed, RING_BUFFER_SAMPLES capacity
+    // Warning: written only before any other task can reach the channel; read unsynchronized.
+    RingGeometry _geometry;
+    RingBuffer _ring_buffer;            ///< PSRAM-backed, _geometry.samples capacity
     std::atomic<size_t> _write_index;   ///< Next write position (owner; released after the samples)
     std::atomic<size_t> _read_index;    ///< Next read position (mixer; released after consuming)
     std::atomic<bool> _eof;             ///< One-shot fully buffered (released after _write_index)
@@ -400,7 +382,7 @@ private:
     static State stateOf(uint32_t status) { return static_cast<State>(status & STATE_MASK); }
     static bool isArmedFor(uint32_t status, uint8_t request);
 
-    static RingBuffer allocateRingBuffer();
+    static RingBuffer allocateRingBuffer(size_t samples);
 
     bool transition(State from, State to);
 

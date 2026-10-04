@@ -12,6 +12,14 @@ static constexpr const char* TAG = "AudioChannel";
 
 static constexpr uint32_t kRingBufferCaps = MALLOC_CAP_SPIRAM;
 
+static constexpr RingGeometry kRingGeometry = RingGeometry::forSamples(RingGeometry::kPsramDefaultSamples);
+
+static_assert(RingGeometry::isValidSize(kRingGeometry.samples));
+static_assert(kRingGeometry.samples == 16384 && kRingGeometry.mask == 16383 &&
+              kRingGeometry.refill_watermark == 8192 && kRingGeometry.max_chunk == 4096 &&
+              kRingGeometry.sd_prefill == 4096 && kRingGeometry.memory_prefill == 16383,
+              "the default ring must keep the 16384-sample geometry");
+
 static constexpr uint32_t toStatus(AudioChannel::State state) {
     return static_cast<uint32_t>(state);
 }
@@ -21,11 +29,11 @@ void AudioChannel::RingBufferFree::operator()(int16_t* samples) const {
     heap_caps_free(samples);
 }
 
-AudioChannel::RingBuffer AudioChannel::allocateRingBuffer() {
-    RingBuffer ring(static_cast<int16_t*>(heap_caps_malloc(RING_BUFFER_SAMPLES * sizeof(int16_t), kRingBufferCaps)));
+AudioChannel::RingBuffer AudioChannel::allocateRingBuffer(size_t samples) {
+    RingBuffer ring(static_cast<int16_t*>(heap_caps_malloc(samples * sizeof(int16_t), kRingBufferCaps)));
     if (!ring) {
         ESP_LOGE(TAG, "Failed to allocate the %zu-sample ring buffer (caps 0x%lx).",
-                 RING_BUFFER_SAMPLES, static_cast<unsigned long>(kRingBufferCaps));
+                 samples, static_cast<unsigned long>(kRingBufferCaps));
     }
     return ring;
 }
@@ -35,7 +43,8 @@ AudioChannel::AudioChannel()
       _loop_enabled(false),
       _wav_header{},
       _file_position(0),
-      _ring_buffer(allocateRingBuffer()),
+      _geometry(kRingGeometry),
+      _ring_buffer(allocateRingBuffer(kRingGeometry.samples)),
       _write_index(0),
       _read_index(0),
       _eof(false),
@@ -146,8 +155,7 @@ esp_err_t AudioChannel::load(std::string_view path, bool loop, uint16_t initial_
     // Memory-backed files fill the whole ring instantly (memcpy from PSRAM);
     // SD-backed files pre-fill only a small slice so triggering a sound holds
     // the SD lock briefly, then the reader task tops the ring up.
-    const size_t prefill_target = memory_backed ? (RING_BUFFER_SAMPLES - 1)
-                                                : INITIAL_PREFILL_SAMPLES;
+    const size_t prefill_target = memory_backed ? _geometry.memory_prefill : _geometry.sd_prefill;
     bool eof = false;
     size_t filled = 0;
     if (seekToData(_file.get())) {
@@ -342,8 +350,7 @@ uint8_t AudioChannel::mixGroup() const {
 }
 
 size_t AudioChannel::mixBufferedSamples() const {
-    return (_mix_write >= _mix_read) ? (_mix_write - _mix_read)
-                                     : (RING_BUFFER_SAMPLES - _mix_read + _mix_write);
+    return _geometry.available(_mix_write, _mix_read);
 }
 
 bool AudioChannel::mixAtEof() const {
@@ -359,7 +366,7 @@ int16_t AudioChannel::getNextSample() {
     }
 
     int16_t sample = _ring_buffer[_mix_read];
-    _mix_read = (_mix_read + 1) % RING_BUFFER_SAMPLES;
+    _mix_read = (_mix_read + 1) & _geometry.mask;
 
     updateVolumeRamp();
 
@@ -447,18 +454,14 @@ bool AudioChannel::isOwnedBy(bool memory_reader) const {
 size_t AudioChannel::availableSamples() const {
     const size_t w = _write_index.load(std::memory_order_acquire);
     const size_t r = _read_index.load(std::memory_order_acquire);
-
-    if (w >= r) {
-        return w - r;
-    }
-    return RING_BUFFER_SAMPLES - r + w;
+    return _geometry.available(w, r);
 }
 
 bool AudioChannel::needsRefill() const {
     const State current = state();
     if (current != State::Ready && current != State::Active && current != State::Stopping) return false;
     if (_eof.load(std::memory_order_acquire)) return false;
-    return availableSamples() < REFILL_WATERMARK;
+    return availableSamples() < _geometry.refill_watermark;
 }
 
 size_t AudioChannel::refillBuffer() {
@@ -470,24 +473,22 @@ size_t AudioChannel::refillBuffer() {
 
     size_t write = _write_index.load(std::memory_order_acquire);
     const size_t read = _read_index.load(std::memory_order_acquire);
-    const size_t available = (write >= read) ? (write - read) : (RING_BUFFER_SAMPLES - read + write);
-
-    size_t free_space = RING_BUFFER_SAMPLES - 1 - available; // -1 to distinguish full from empty
+    const size_t free_space = _geometry.freeSpace(write, read);
 
     if (free_space == 0) return 0;
 
-    size_t to_read = std::min({free_space, REFILL_WATERMARK, MAX_SD_CHUNK_SAMPLES});
+    const size_t to_read = std::min({free_space, _geometry.refill_watermark, _geometry.max_chunk});
 
     // Read directly into the ring buffer at the write index. Split into up to two
     // contiguous reads when the target region wraps past the end of the buffer.
     bool eof = false;
-    size_t contiguous = std::min(to_read, RING_BUFFER_SAMPLES - write);
+    const size_t contiguous = std::min(to_read, _geometry.contiguousFrom(write));
     size_t total_read = readFromFile(_ring_buffer.get() + write, contiguous, eof);
-    write = (write + total_read) % RING_BUFFER_SAMPLES;
+    write = _geometry.advance(write, total_read);
 
     if (total_read == contiguous && to_read > contiguous && !eof) {
         const size_t second = readFromFile(_ring_buffer.get() + write, to_read - contiguous, eof);
-        write = (write + second) % RING_BUFFER_SAMPLES;
+        write = _geometry.advance(write, second);
         total_read += second;
     }
 
