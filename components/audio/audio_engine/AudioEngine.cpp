@@ -3,6 +3,7 @@
 #include "I2sTransmitter.hpp"
 #include "InternalRam.hpp"
 #include "PolyphonicMixer.hpp"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
 #include "freertos/semphr.h"
@@ -34,6 +35,9 @@ static constexpr BaseType_t kAudioCore = 1;
 #else
 static constexpr BaseType_t kAudioCore = tskNO_AFFINITY;
 #endif
+
+static constexpr uint32_t kPsramRingCaps = MALLOC_CAP_SPIRAM;
+static constexpr uint32_t kInternalRingCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 
 static constexpr uint32_t kDmaFrameCount = 256;
 static constexpr uint32_t kDmaDescCount = 4;
@@ -128,6 +132,9 @@ struct AudioEngineImpl {
     std::atomic<uint32_t> i2s_write_errors{0};
     std::atomic<uint32_t> load_failures{0};
     std::atomic<uint32_t> no_free_channels{0};
+
+    std::atomic<bool> rings_in_psram{false};
+    std::atomic<uint32_t> ring_samples{0};
 };
 
 static uint8_t next_group_id(AudioEngineImpl* impl) {
@@ -367,6 +374,17 @@ esp_err_t AudioEngine::init() {
         return ESP_ERR_INVALID_ARG;
     }
 
+    const bool psram_present = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+    const RingPlacement ring = resolveRingPlacement(config.ring_memory, config.ring_buffer_samples, psram_present);
+    if (!ring.valid) {
+        ESP_LOGE(TAG, "Invalid ring configuration (memory %u, %lu samples); the size must be 0 or a "
+                      "power of two from %u to %u.",
+                 static_cast<unsigned>(config.ring_memory), static_cast<unsigned long>(config.ring_buffer_samples),
+                 static_cast<unsigned>(RingGeometry::kMinSamples), static_cast<unsigned>(RingGeometry::kMaxSamples));
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char* const ring_memory_name = ring.in_psram ? "PSRAM" : "internal RAM";
+
     auto i2s = std::make_unique<I2sTransmitter>(I2sTransmitter::Config{
         .bclk_pin        = config.bclk_pin,
         .ws_pin          = config.ws_pin,
@@ -386,6 +404,17 @@ esp_err_t AudioEngine::init() {
         return ESP_ERR_NO_MEM;
     }
 
+    // Warning: the rings are allocated before the channels are committed and before any engine
+    // task exists, which is what lets the mixer and readers read the geometry unsynchronized.
+    const uint32_t ring_caps = ring.in_psram ? kPsramRingCaps : kInternalRingCaps;
+    for (uint8_t i = 0; i < config.max_channels; ++i) {
+        if (const esp_err_t ret = channels[i].allocateRing(ring.samples, ring_caps); ret != ESP_OK) {
+            ESP_LOGE(TAG, "Cannot allocate ring %u of %u (%lu samples) in %s: %s", i + 1, config.max_channels,
+                     static_cast<unsigned long>(ring.samples), ring_memory_name, esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
     auto mixer = InternalRam::make<PolyphonicMixer>(std::span<AudioChannel>(channels.get(), config.max_channels),
                                                     config.compressor_gain_threshold, config.dc_cutoff);
     if (!mixer) {
@@ -402,7 +431,13 @@ esp_err_t AudioEngine::init() {
     _impl->i2s = std::move(i2s);
     _impl->channels = std::move(channels);
     _impl->mixer = std::move(mixer);
+    // Trick: release on the size, so a caller that reads a non-zero size also reads the memory flag.
+    _impl->rings_in_psram.store(ring.in_psram, std::memory_order_relaxed);
+    _impl->ring_samples.store(ring.samples, std::memory_order_release);
 
+    ESP_LOGI(TAG, "Ring buffers: %u x %lu samples in %s (%lu KB)", config.max_channels,
+             static_cast<unsigned long>(ring.samples), ring_memory_name,
+             static_cast<unsigned long>(config.max_channels * ring.samples * sizeof(int16_t) / 1024));
     ESP_LOGI(TAG, "AudioEngine initialized successfully.");
     return ESP_OK;
 }
@@ -621,6 +656,16 @@ AudioEngine::ChannelInfo AudioEngine::channelInfo(ChannelId id) const {
     info.start_cycle = ch.startCycle();
     info.underruns = ch.underruns();
     return info;
+}
+
+uint32_t AudioEngine::ringBufferSamples() const {
+    if (!_impl) return 0;
+    return _impl->ring_samples.load(std::memory_order_acquire);
+}
+
+bool AudioEngine::ringBuffersInPsram() const {
+    if (!_impl) return false;
+    return _impl->rings_in_psram.load(std::memory_order_relaxed);
 }
 
 } // namespace Espressif::Wrappers::Audio

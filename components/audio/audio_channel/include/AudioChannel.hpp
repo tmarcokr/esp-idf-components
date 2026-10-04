@@ -31,6 +31,7 @@ namespace Espressif::Wrappers::Audio {
  * | `Closing`  | owning reader, which closes and resets it    | no               | no       |
  *
  * Thread safety model:
+ * - allocateRing(): once, before any other task can reach the channel (AudioEngine::init()).
  * - claim() / load(): caller task (only the task that won claim() may call load()).
  * - requestStop() / setTargetVolume(): any task, lock-free.
  * - arm() / disarm(): the task that runs AudioEngine::startGroup().
@@ -65,7 +66,7 @@ public:
     };
 
     /**
-     * @brief Construct a new Audio Channel.
+     * @brief Construct an Idle channel without a ring buffer (see allocateRing()).
      */
     AudioChannel();
 
@@ -78,6 +79,20 @@ public:
 
     AudioChannel(const AudioChannel&) = delete;
     AudioChannel& operator=(const AudioChannel&) = delete;
+
+    /**
+     * @brief Allocate the ring buffer and derive its geometry; at most once per channel.
+     *
+     * Warning: the geometry and the buffer are read without synchronization by the mixer and
+     * the readers, so this must run before any other task can reach the channel (the engine
+     * calls it from init(), before its tasks exist). A ring is never resized or reallocated.
+     *
+     * @param samples Ring size in samples; must pass RingGeometry::isValidSize().
+     * @param caps heap_caps capabilities of the buffer memory.
+     * @return ESP_OK on success; ESP_ERR_INVALID_STATE if the ring is already allocated;
+     *         ESP_ERR_INVALID_ARG for an invalid size; ESP_ERR_NO_MEM if the memory is exhausted.
+     */
+    [[nodiscard]] esp_err_t allocateRing(size_t samples, uint32_t caps);
 
     /**
      * @brief Claim an Idle channel for loading (Idle → Loading).
@@ -349,10 +364,11 @@ private:
     WavHeader _wav_header;
     uint32_t _file_position;        ///< Current read position in data section (bytes)
 
-    // --- Ring Buffer (allocated in PSRAM) ---
-    // Warning: written only before any other task can reach the channel; read unsynchronized.
+    // --- Ring Buffer ---
+    // Warning: written once by allocateRing() before any other task can reach the channel;
+    // read unsynchronized.
     RingGeometry _geometry;
-    RingBuffer _ring_buffer;            ///< PSRAM-backed, _geometry.samples capacity
+    RingBuffer _ring_buffer;            ///< _geometry.samples capacity; null until allocateRing()
     std::atomic<size_t> _write_index;   ///< Next write position (owner; released after the samples)
     std::atomic<size_t> _read_index;    ///< Next read position (mixer; released after consuming)
     std::atomic<bool> _eof;             ///< One-shot fully buffered (released after _write_index)
@@ -381,8 +397,6 @@ private:
 
     static State stateOf(uint32_t status) { return static_cast<State>(status & STATE_MASK); }
     static bool isArmedFor(uint32_t status, uint8_t request);
-
-    static RingBuffer allocateRingBuffer(size_t samples);
 
     bool transition(State from, State to);
 

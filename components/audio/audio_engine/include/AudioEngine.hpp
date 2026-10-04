@@ -7,6 +7,7 @@
 #include <span>
 #include <string_view>
 #include "DcBlocker.hpp"
+#include "RingMemory.hpp"
 
 namespace Espressif::Wrappers::Audio {
 
@@ -60,9 +61,18 @@ public:
         gpio_num_t dout_pin;                    ///< I2S data out pin
         gpio_num_t sd_mode_pin  = GPIO_NUM_NC;  ///< MAX98357A SD_MODE pin for anti-pop
         uint32_t sample_rate    = 44100;        ///< Output sample rate (Hz)
-        uint8_t max_channels    = 9;            ///< Maximum simultaneous channels (up to 32)
+        /// Maximum simultaneous channels (up to 32). Their rings take
+        /// max_channels x ring_buffer_samples x 2 bytes; without PSRAM keep it at 6 or fewer
+        /// while a radio (Wi-Fi, Bluetooth, Thread) is active.
+        uint8_t max_channels    = 9;
         uint16_t compressor_gain_threshold = 800; ///< Dynamic range compressor baseline threshold
         DcBlocker::CutoffPreset dc_cutoff = DcBlocker::CutoffPreset::Hz50; ///< High-pass filter cutoff
+        RingMemory ring_memory  = RingMemory::Auto; ///< Ring buffer memory (see RingMemory).
+        /// Samples per channel ring: 0 selects 16384 in PSRAM or 4096 in internal RAM; otherwise a
+        /// power of two from 2048 to 65536. A 4096-sample ring buffers 93 ms (16384: 371 ms), so
+        /// SD latency spikes from other tasks show up as underruns sooner; use 8192 when internal
+        /// RAM allows.
+        uint32_t ring_buffer_samples = 0;
     };
 
     /**
@@ -89,12 +99,15 @@ public:
      * Must be called before start(). Initializes the I2S transmitter
      * and allocates the channel array and mixer.
      *
-     * Objects shared with the mixer are allocated in internal RAM; the per-channel ring
-     * buffers in PSRAM. On failure nothing is kept and init() may be called again.
+     * Objects shared with the mixer are allocated in internal RAM. The per-channel ring
+     * buffers go where Config::ring_memory says; RingMemory::Auto checks once, here, whether
+     * the heap has PSRAM. There is no per-channel fallback: if the chosen memory cannot hold
+     * every ring, init() fails. On failure nothing is kept and init() may be called again.
      *
      * @return esp_err_t ESP_OK on success; ESP_ERR_INVALID_ARG if max_channels is 0 or
-     *         exceeds 32; ESP_ERR_INVALID_STATE if already initialized; ESP_ERR_NO_MEM if
-     *         internal RAM is exhausted; an I2S or GPIO error otherwise.
+     *         exceeds 32, or for an invalid ring_memory or ring_buffer_samples;
+     *         ESP_ERR_INVALID_STATE if already initialized; ESP_ERR_NO_MEM if internal RAM or
+     *         the ring memory is exhausted; an I2S or GPIO error otherwise.
      */
     [[nodiscard]] esp_err_t init();
 
@@ -270,6 +283,18 @@ public:
      * @return The channel snapshot; all zero for an invalid id or before init().
      */
     ChannelInfo channelInfo(ChannelId id) const;
+
+    /**
+     * @brief Samples per channel ring chosen by init(); callable from any task (atomic read).
+     * @return The ring size, or 0 before a successful init().
+     */
+    uint32_t ringBufferSamples() const;
+
+    /**
+     * @brief Whether init() placed the ring buffers in PSRAM; callable from any task (atomic read).
+     * @return true for PSRAM; false for internal RAM or before a successful init().
+     */
+    bool ringBuffersInPsram() const;
 
 private:
     struct ImplDeleter {

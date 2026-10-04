@@ -5,20 +5,18 @@
 #include <algorithm>
 #include <cstring>
 #include <sys/stat.h>
+#include <utility>
 
 namespace Espressif::Wrappers::Audio {
 
 static constexpr const char* TAG = "AudioChannel";
 
-static constexpr uint32_t kRingBufferCaps = MALLOC_CAP_SPIRAM;
+static constexpr RingGeometry kPsramDefaultGeometry = RingGeometry::forSamples(RingGeometry::kPsramDefaultSamples);
 
-static constexpr RingGeometry kRingGeometry = RingGeometry::forSamples(RingGeometry::kPsramDefaultSamples);
-
-static_assert(RingGeometry::isValidSize(kRingGeometry.samples));
-static_assert(kRingGeometry.samples == 16384 && kRingGeometry.mask == 16383 &&
-              kRingGeometry.refill_watermark == 8192 && kRingGeometry.max_chunk == 4096 &&
-              kRingGeometry.sd_prefill == 4096 && kRingGeometry.memory_prefill == 16383,
-              "the default ring must keep the 16384-sample geometry");
+static_assert(kPsramDefaultGeometry.samples == 16384 && kPsramDefaultGeometry.mask == 16383 &&
+              kPsramDefaultGeometry.refill_watermark == 8192 && kPsramDefaultGeometry.max_chunk == 4096 &&
+              kPsramDefaultGeometry.sd_prefill == 4096 && kPsramDefaultGeometry.memory_prefill == 16383,
+              "the PSRAM default ring must keep the 16384-sample geometry");
 
 static constexpr uint32_t toStatus(AudioChannel::State state) {
     return static_cast<uint32_t>(state);
@@ -29,13 +27,16 @@ void AudioChannel::RingBufferFree::operator()(int16_t* samples) const {
     heap_caps_free(samples);
 }
 
-AudioChannel::RingBuffer AudioChannel::allocateRingBuffer(size_t samples) {
-    RingBuffer ring(static_cast<int16_t*>(heap_caps_malloc(samples * sizeof(int16_t), kRingBufferCaps)));
-    if (!ring) {
-        ESP_LOGE(TAG, "Failed to allocate the %zu-sample ring buffer (caps 0x%lx).",
-                 samples, static_cast<unsigned long>(kRingBufferCaps));
-    }
-    return ring;
+esp_err_t AudioChannel::allocateRing(size_t samples, uint32_t caps) {
+    if (_ring_buffer) return ESP_ERR_INVALID_STATE;
+    if (!RingGeometry::isValidSize(samples)) return ESP_ERR_INVALID_ARG;
+
+    RingBuffer ring(static_cast<int16_t*>(heap_caps_malloc(samples * sizeof(int16_t), caps)));
+    if (!ring) return ESP_ERR_NO_MEM;
+
+    _geometry = RingGeometry::forSamples(samples);
+    _ring_buffer = std::move(ring);
+    return ESP_OK;
 }
 
 AudioChannel::AudioChannel()
@@ -43,8 +44,7 @@ AudioChannel::AudioChannel()
       _loop_enabled(false),
       _wav_header{},
       _file_position(0),
-      _geometry(kRingGeometry),
-      _ring_buffer(allocateRingBuffer(kRingGeometry.samples)),
+      _geometry{},
       _write_index(0),
       _read_index(0),
       _eof(false),
