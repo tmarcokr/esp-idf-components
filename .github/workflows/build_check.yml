@@ -36,9 +36,21 @@ jobs:
           target: ${{ matrix.target }}
           path: "examples/${{ matrix.example }}"
 
+  host_tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and run host tests
+        run: |
+          g++ --version
+          bash test/host/run_host_tests.sh
+
   esp32_build_job:
     name: ESP-IDF Final Build Status
-    needs: build_matrix
+    needs: [build_matrix, host_tests]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -48,4 +60,8 @@ jobs:
             echo "One or more builds in the matrix failed."
             exit 1
           fi
-          echo "All builds passed successfully."
+          if [[ "${{ needs.host_tests.result }}" != "success" ]]; then
+            echo "The host tests failed."
+            exit 1
+          fi
+          echo "All builds and host tests passed successfully."
