@@ -3,19 +3,31 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "sdkconfig.h"
 #include <cmath>
 #include <vector>
 
 static const char *TAG = "AUDIO_TONE_EXAMPLE";
+
+// Pin map per target: see README.md (on the ESP32-S3 DevKitC-1, GPIO 19/20 are the native USB pins).
+#if CONFIG_IDF_TARGET_ESP32
+static constexpr gpio_num_t kI2sBclk = GPIO_NUM_26;
+static constexpr gpio_num_t kI2sWs = GPIO_NUM_25;
+static constexpr gpio_num_t kI2sDout = GPIO_NUM_22;
+#else
+static constexpr gpio_num_t kI2sBclk = GPIO_NUM_18;
+static constexpr gpio_num_t kI2sWs = GPIO_NUM_19;
+static constexpr gpio_num_t kI2sDout = GPIO_NUM_20;
+#endif
 
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Starting Audio Tone Example (440Hz Sine Wave)...");
 
     // Configure I2S pins for MAX98357A amplifier
     Espressif::Wrappers::I2sTransmitter::Config i2s_cfg = {
-        .bclk_pin = GPIO_NUM_18,   // BCLK (Bit Clock)
-        .ws_pin = GPIO_NUM_19,     // LRC (Word Select / Left-Right Clock)
-        .dout_pin = GPIO_NUM_20,   // DIN (Data In)
+        .bclk_pin = kI2sBclk,   // BCLK (Bit Clock)
+        .ws_pin = kI2sWs,       // LRC (Word Select / Left-Right Clock)
+        .dout_pin = kI2sDout,   // DIN (Data In)
         .sample_rate = 44100,
         .dma_frame_count = 256,
         .dma_desc_count = 2

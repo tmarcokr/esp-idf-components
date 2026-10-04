@@ -3,4 +3,4 @@ idf_component_register(SRCS "AudioEngine.cpp" "PolyphonicMixer.cpp"
                        REQUIRES audio_channel i2s_transmitter freertos
                        PRIV_REQUIRES esp_driver_gpio)
 
-target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_20)
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)

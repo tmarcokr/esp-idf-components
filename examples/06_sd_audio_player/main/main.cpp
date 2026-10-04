@@ -3,20 +3,40 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "SD_AUDIO_EXAMPLE";
+
+// Pin map per target: see README.md (on the ESP32-S3 DevKitC-1, GPIO 19/20 are the native USB pins).
+#if CONFIG_IDF_TARGET_ESP32
+static constexpr gpio_num_t kSdMiso = GPIO_NUM_19;
+static constexpr gpio_num_t kSdMosi = GPIO_NUM_23;
+static constexpr gpio_num_t kSdSck = GPIO_NUM_18;
+static constexpr gpio_num_t kSdCs = GPIO_NUM_5;
+static constexpr gpio_num_t kI2sBclk = GPIO_NUM_26;
+static constexpr gpio_num_t kI2sWs = GPIO_NUM_25;
+static constexpr gpio_num_t kI2sDout = GPIO_NUM_22;
+#else
+static constexpr gpio_num_t kSdMiso = GPIO_NUM_4;
+static constexpr gpio_num_t kSdMosi = GPIO_NUM_11;
+static constexpr gpio_num_t kSdSck = GPIO_NUM_7;
+static constexpr gpio_num_t kSdCs = GPIO_NUM_10;
+static constexpr gpio_num_t kI2sBclk = GPIO_NUM_18;
+static constexpr gpio_num_t kI2sWs = GPIO_NUM_19;
+static constexpr gpio_num_t kI2sDout = GPIO_NUM_20;
+#endif
 
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Starting SD Audio Player Example...");
     ESP_LOGW(TAG, "Make sure you have a file named 'test.wav' on your SD Card!");
-    ESP_LOGW(TAG, "The WAV file must be: 44.1kHz, 16-bit, Mono or Stereo.");
+    ESP_LOGW(TAG, "The WAV file must be: 44.1kHz, 16-bit, mono.");
 
     // 1. Configure and Mount the SD Card
     Espressif::Wrappers::SdCard::Config sd_cfg = {
-        .miso = GPIO_NUM_4, 
-        .mosi = GPIO_NUM_11, 
-        .sck = GPIO_NUM_7, 
-        .cs = GPIO_NUM_10,
+        .miso = kSdMiso,
+        .mosi = kSdMosi,
+        .sck = kSdSck,
+        .cs = kSdCs,
         .mount_point = "/sdcard", 
         .max_files = 5, 
         .format_if_mount_failed = false
@@ -32,9 +52,9 @@ extern "C" void app_main(void) {
 
     // 2. Configure and Start the Audio Engine (I2S DMA + Mixer)
     Espressif::Wrappers::Audio::AudioEngine::Config audio_cfg = {
-        .bclk_pin = GPIO_NUM_18,
-        .ws_pin = GPIO_NUM_19,
-        .dout_pin = GPIO_NUM_20,
+        .bclk_pin = kI2sBclk,
+        .ws_pin = kI2sWs,
+        .dout_pin = kI2sDout,
         // .sd_mode_pin = GPIO_NUM_NC, // Optional, if your MAX98357A uses the SD_MODE pin to power on/off
         .sample_rate = 44100,
         .max_channels = 2 // We only need 1 or 2 channels for this example

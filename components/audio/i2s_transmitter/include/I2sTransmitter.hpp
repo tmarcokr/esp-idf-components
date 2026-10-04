@@ -12,7 +12,9 @@ namespace Espressif::Wrappers {
  * @brief RAII wrapper for I2S Standard Mode transmitter with DMA double-buffering.
  *
  * Designed for mono 16-bit PCM output to a MAX98357A Class-D amplifier.
- * Uses the ESP-IDF v5 I2S channel-based API with DMA for CPU-efficient transfers.
+ * Uses the ESP-IDF I2S standard-mode driver (driver/i2s_std.h, ESP-IDF v5.3+ and v6.x) with DMA
+ * for CPU-efficient transfers. The channel runs in stereo slot mode: write() copies each mono
+ * sample into both the left and the right slot of a frame.
  */
 class I2sTransmitter {
 public:
@@ -59,7 +61,8 @@ public:
      *
      * This call blocks until the DMA is ready to accept new data, making it
      * naturally paced by the I2S clock. The mixer task should call this in a
-     * loop to maintain continuous audio output.
+     * loop to maintain continuous audio output. Never logs: the caller decides how
+     * to report errors.
      *
      * @param data Pointer to 16-bit signed PCM samples (mono).
      * @param frame_count Number of frames to write.
@@ -84,7 +87,7 @@ private:
     i2s_chan_handle_t _tx_handle;
     bool _initialized;
 
-    /// Temporary buffer for mono-to-stereo expansion (required for C6 stability)
+    /// Stereo frames built by write(): each mono sample duplicated into the left and right slots.
     std::vector<int16_t> _stereo_buffer;
 
     /// @brief I2S write timeout in milliseconds (increased to 1000ms for safety margin).

@@ -1,0 +1,125 @@
+menu "Audio Stress Test"
+
+    choice STRESS_START_MODE
+        prompt "Loop pair start mode"
+        default STRESS_START_MODE_LINKED
+        help
+            How the controller task and the null test start the two looping layers of a pair.
+
+        config STRESS_START_MODE_LINKED
+            bool "Linked (playLinked(), same mixer cycle)"
+        config STRESS_START_MODE_SEQUENTIAL
+            bool "Sequential (two play() calls)"
+    endchoice
+
+    config STRESS_NULL_TEST_PERIOD_S
+        int "Null test period (s)"
+        range 5 3600
+        default 30
+        help
+            Every period the stress tasks pause for 3 s and loop_a/loop_b (b = -a) play as a
+            pair; with sample-exact alignment the mixed output cancels.
+
+    config STRESS_NULL_VOLUME
+        int "Null test layer volume (0-16384)"
+        range 0 16384
+        default 12000
+
+    config STRESS_NULL_MAX_LEVEL
+        int "Null test pass limit for getOutputLevel() (0-16384)"
+        range 0 16384
+        default 8
+
+    config STRESS_DURATION_S
+        int "Run time before the quiesce check (s)"
+        range 10 86400
+        default 600
+
+    config STRESS_MAX_CHANNELS
+        int "Audio engine channel count"
+        range 4 32
+        default 9
+
+    choice STRESS_RING_MEMORY
+        prompt "Ring buffer memory"
+        default STRESS_RING_MEMORY_AUTO
+        help
+            Where the audio engine allocates the per-channel ring buffers (AudioEngine::Config::ring_memory).
+            INTERNAL exercises the no-PSRAM path on a board that has PSRAM.
+
+        config STRESS_RING_MEMORY_AUTO
+            bool "Auto (PSRAM when present, internal RAM otherwise)"
+        config STRESS_RING_MEMORY_PSRAM
+            bool "PSRAM only"
+        config STRESS_RING_MEMORY_INTERNAL
+            bool "Internal RAM only"
+    endchoice
+
+    config STRESS_RING_SAMPLES
+        int "Ring buffer samples per channel (0 = engine default)"
+        range 0 65536
+        default 0
+        help
+            0 selects 16384 samples in PSRAM or 4096 in internal RAM. Any other value must be a
+            power of two from 2048 to 65536, or the engine init fails with ESP_ERR_INVALID_ARG.
+
+    config STRESS_LOOP_VOLUME
+        int "Loop layer volume (0-16384)"
+        range 0 16384
+        default 4096
+
+    config STRESS_SHOT_VOLUME
+        int "One-shot volume (0-16384)"
+        range 0 16384
+        default 8192
+
+    config STRESS_PAIR_WAIT_MIN_MS
+        int "Minimum wait between pair restarts (ms)"
+        range 0 10000
+        default 2
+
+    config STRESS_PAIR_WAIT_MAX_MS
+        int "Maximum wait between pair restarts (ms)"
+        range 0 10000
+        default 30
+
+    config STRESS_SHOT_INTERVAL_MIN_MS
+        int "Minimum interval between one-shots (ms)"
+        range 0 10000
+        default 10
+
+    config STRESS_SHOT_INTERVAL_MAX_MS
+        int "Maximum interval between one-shots (ms)"
+        range 0 10000
+        default 80
+
+    config STRESS_SHOT_STOP_ONE_IN
+        int "Stop one in N one-shots early"
+        range 1 1000
+        default 3
+
+    config STRESS_SHOT_STOP_DELAY_MAX_MS
+        int "Maximum delay before an early one-shot stop (ms)"
+        range 0 1000
+        default 20
+
+    config STRESS_STORM_STOPS
+        int "stop() calls per stop storm"
+        range 1 100000
+        default 1000
+
+    config STRESS_STORM_PERIOD_S
+        int "Stop storm period (s)"
+        range 1 3600
+        default 60
+
+    config STRESS_SD_CONTENTION
+        bool "Read a scratch file in a loop to contend for the SD card"
+        default n
+
+    config STRESS_REPORT_PERIOD_S
+        int "Report period (s)"
+        range 1 3600
+        default 5
+
+endmenu
