@@ -56,6 +56,11 @@ inline constexpr uint32_t squareRootFloor(uint32_t x) {
  * Transients are dynamically compressed before the final output clamping
  * to prevent digital clipping and mechanical speaker distortion.
  *
+ * The formula is the same on every target. With the float root (targets with an FPU: ESP32,
+ * ESP32-S3) the output is bit-exact with the original compressor. With the integer root
+ * (targets without an FPU, such as the ESP32-C6) the divisor differs by at most 1, only for
+ * large envelopes, which moves a sample by less than 17 LSB.
+ *
  * @tparam Root Square root of the envelope; use the DynamicRangeCompressor alias, which picks
  *         the float root on targets with an FPU and the integer root otherwise.
  */
@@ -146,6 +151,9 @@ private:
 
 /**
  * @brief The compressor with the native envelope root of the target (see kNativeEnvelopeRoot).
+ *
+ * An alias of a class template, so it cannot be forward-declared with
+ * `class DynamicRangeCompressor;`; include this header instead.
  */
 using DynamicRangeCompressor = BasicDynamicRangeCompressor<kNativeEnvelopeRoot>;
 

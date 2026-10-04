@@ -16,9 +16,9 @@ class AudioChannel;
 /**
  * @brief Polyphonic audio mixer with 32-bit accumulation and soft-clipping.
  *
- * Sums samples from all active AudioChannels into a single mono output buffer,
- * applies global volume scaling, soft-clipping to prevent DAC overflow, and
- * tracks RMS output level for LED reactivity.
+ * Sums samples from all active AudioChannels into a single mono output buffer, then
+ * applies the DC blocker and the dynamic range compressor (which also applies the global
+ * volume and clamps to 16 bits), and tracks the RMS output level for LED reactivity.
  *
  * This class is internal to the AudioEngine and should NOT be used directly.
  */
@@ -62,9 +62,12 @@ public:
      * when one of them has fewer than @p frame_count samples buffered and none has its
      * end of file buffered, so they stay sample-aligned. For each frame:
      * 1. Sum all active channel samples into a 32-bit accumulator
-     * 2. Apply global volume scaling (14-bit fixed-point)
-     * 3. Apply soft-clipping to prevent DAC overflow
+     * 2. Remove DC and sub-bass with the DC blocker
+     * 3. Compress, with the global volume folded into the compressor gain, and clamp to 16 bits
      * 4. Update running RMS tracker
+     *
+     * Never logs and never blocks; peaks, clipping, underruns and group holds are counted
+     * (see takeStats()).
      *
      * @param output Destination buffer for 16-bit mono PCM samples.
      * @param frame_count Number of frames to produce.

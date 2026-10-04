@@ -520,7 +520,6 @@ size_t AudioChannel::readFromFile(int16_t* dest, size_t samples_requested, bool&
     while (total_read < samples_requested) {
         if (state() == State::Closing) break;
 
-        // How many bytes remain in the data section?
         uint32_t bytes_remaining = _wav_header.data_size - _file_position;
         if (bytes_remaining < sizeof(int16_t)) {
             if (!_loop_enabled) {
@@ -556,7 +555,6 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
 
     if (fseek(file, 0, SEEK_SET) != 0) return ESP_FAIL;
 
-    // --- RIFF header ---
     char riff_id[4];
     uint32_t riff_size;
     char wave_id[4];
@@ -570,7 +568,6 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    // --- Search for fmt and data chunks ---
     bool found_fmt = false;
     bool found_data = false;
 
@@ -582,7 +579,6 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
         if (fread(&chunk_size, 4, 1, file) != 1) break;
 
         if (std::memcmp(chunk_id, "fmt ", 4) == 0) {
-            // Format chunk
             uint16_t audio_format;
             if (fread(&audio_format, 2, 1, file) != 1) return ESP_ERR_INVALID_SIZE;
 
@@ -600,11 +596,9 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
             if (fread(&block_align, 2, 1, file) != 1) return ESP_ERR_INVALID_SIZE;
             if (fread(&header.bits_per_sample, 2, 1, file) != 1) return ESP_ERR_INVALID_SIZE;
 
-            // Skip any extra fmt bytes
             long extra = static_cast<long>(chunk_size) - 16;
             if (extra > 0 && fseek(file, extra, SEEK_CUR) != 0) return ESP_FAIL;
 
-            // Validate constraints
             if (header.num_channels != 1) {
                 ESP_LOGE(TAG, "Unsupported channel count: %u (expected mono)", header.num_channels);
                 return ESP_ERR_NOT_SUPPORTED;
@@ -628,7 +622,6 @@ esp_err_t AudioChannel::parseWavHeader(FILE* file, WavHeader& header) {
             header.data_offset = static_cast<uint32_t>(data_offset);
             header.data_size = chunk_size;
             found_data = true;
-            // Don't skip — caller will seek to data_offset
 
         } else {
             if (fseek(file, static_cast<long>(chunk_size), SEEK_CUR) != 0) return ESP_FAIL;

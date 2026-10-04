@@ -30,7 +30,18 @@ namespace Espressif::Wrappers::Audio {
  * | `Stopping` | owning reader                                | yes, fading to 0 | yes      |
  * | `Closing`  | owning reader, which closes and resets it    | no               | no       |
  *
- * Thread safety model:
+ * Transitions: claim() Idle → Loading; load() Loading → Ready (or back to Idle on failure);
+ * start() Ready → Active; requestStop() Active → Stopping or Ready → Closing; endMixCycle()
+ * Stopping → Closing once the fade ends or the ring runs dry, and Active → Closing when a
+ * one-shot played to its end; closeIfClosing() Closing → Idle. Every transition is a CAS or a
+ * release store, and every state read is an acquire load, so the new owner sees the fields its
+ * predecessor wrote.
+ *
+ * Ring geometry (see RingGeometry): N is a power of two from 2048 to 65536 samples, fixed by
+ * allocateRing(). The reader refills below N/2 in reads of at most N/4 samples; load() prefills
+ * N/4 samples from an SD file and N - 1 (the whole ring) from a memory-backed file.
+ *
+ * Thread safety model (the state decides who may call what):
  * - allocateRing(): once, before any other task can reach the channel (AudioEngine::init()).
  * - claim() / load(): caller task (only the task that won claim() may call load()).
  * - requestStop() / setTargetVolume(): any task, lock-free.
@@ -156,7 +167,11 @@ public:
     bool start(uint8_t request, uint32_t cycle);
 
     /**
-     * @brief Mixer only: set the linked group id of an Active channel (0 = not linked).
+     * @brief Mixer only: set the linked group id of a channel it has just started (0 = not linked).
+     *
+     * The channel may already be Stopping if a stop() raced with the start; a Stopping channel
+     * leaves its group (id cleared) at its next beginMixCycle().
+     *
      * @param group Group id.
      */
     void setGroup(uint8_t group);
@@ -411,7 +426,7 @@ private:
     // Warning: the caller must own the channel. A failed seek is counted as a read failure.
     [[nodiscard]] bool seekToData(FILE* file);
 
-    // Keeps the header value when the file size is unknown (fstat fails or reports no size).
+    // Warning: keeps the header value when the file size is unknown (fstat fails or reports no size).
     void clampDataSizeToFile(FILE* file);
 
     /**
