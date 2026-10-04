@@ -40,6 +40,29 @@ menu "Audio Stress Test"
         range 4 32
         default 9
 
+    choice STRESS_RING_MEMORY
+        prompt "Ring buffer memory"
+        default STRESS_RING_MEMORY_AUTO
+        help
+            Where the audio engine allocates the per-channel ring buffers (AudioEngine::Config::ring_memory).
+            INTERNAL exercises the no-PSRAM path on a board that has PSRAM.
+
+        config STRESS_RING_MEMORY_AUTO
+            bool "Auto (PSRAM when present, internal RAM otherwise)"
+        config STRESS_RING_MEMORY_PSRAM
+            bool "PSRAM only"
+        config STRESS_RING_MEMORY_INTERNAL
+            bool "Internal RAM only"
+    endchoice
+
+    config STRESS_RING_SAMPLES
+        int "Ring buffer samples per channel (0 = engine default)"
+        range 0 65536
+        default 0
+        help
+            0 selects 16384 samples in PSRAM or 4096 in internal RAM. Any other value must be a
+            power of two from 2048 to 65536, or the engine init fails with ESP_ERR_INVALID_ARG.
+
     config STRESS_LOOP_VOLUME
         int "Loop layer volume (0-16384)"
         range 0 16384

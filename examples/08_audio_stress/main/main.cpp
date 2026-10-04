@@ -31,6 +31,7 @@ using Espressif::Wrappers::SdCard;
 using Espressif::Wrappers::Audio::AudioEngine;
 using Espressif::Wrappers::Audio::ChannelId;
 using Espressif::Wrappers::Audio::INVALID_CHANNEL;
+using Espressif::Wrappers::Audio::RingMemory;
 
 constexpr const char* TAG = "AUDIO_STRESS";
 
@@ -44,6 +45,14 @@ constexpr bool kSdmmcSupported = false;
 constexpr bool kSdContention = true;
 #else
 constexpr bool kSdContention = false;
+#endif
+
+#if CONFIG_STRESS_RING_MEMORY_PSRAM
+constexpr RingMemory kRingMemory = RingMemory::Psram;
+#elif CONFIG_STRESS_RING_MEMORY_INTERNAL
+constexpr RingMemory kRingMemory = RingMemory::Internal;
+#else
+constexpr RingMemory kRingMemory = RingMemory::Auto;
 #endif
 
 #if CONFIG_STRESS_START_MODE_LINKED
@@ -572,8 +581,10 @@ void logReport(const StressContext& ctx) {
 
     const AudioEngine::Stats stats = ctx.engine.getStats();
     ESP_LOGI(TAG,
-             "engine busy %u open %u | underruns %" PRIu32 " group_holds %" PRIu32 " i2s_err %" PRIu32
-             " load_fail %" PRIu32 " no_free %" PRIu32 " read_fail %" PRIu32 " | peak in %" PRId32 " out %" PRId32 " clipped %" PRIu32,
+             "engine ring %" PRIu32 " in %s | busy %u open %u | underruns %" PRIu32 " group_holds %" PRIu32
+             " i2s_err %" PRIu32 " load_fail %" PRIu32 " no_free %" PRIu32 " read_fail %" PRIu32 " | peak in %" PRId32
+             " out %" PRId32 " clipped %" PRIu32,
+             ctx.engine.ringBufferSamples(), ctx.engine.ringBuffersInPsram() ? "PSRAM" : "internal RAM",
              stats.busy_channels, stats.open_files, stats.underruns, stats.group_holds, stats.i2s_write_errors,
              stats.load_failures, stats.no_free_channels, stats.read_failures, stats.peak_in, stats.peak_out, stats.clipped_samples);
     ESP_LOGI(TAG,
@@ -696,6 +707,8 @@ AudioEngine::Config engineConfig(gpio_num_t sd_mode_pin) {
         .dout_pin = BoardPins::kI2sDout,
         .sd_mode_pin = sd_mode_pin,
         .max_channels = CONFIG_STRESS_MAX_CHANNELS,
+        .ring_memory = kRingMemory,
+        .ring_buffer_samples = CONFIG_STRESS_RING_SAMPLES,
     };
 }
 
