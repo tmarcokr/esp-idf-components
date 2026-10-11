@@ -8,7 +8,7 @@
 namespace Espressif::Wrappers {
 
 /**
- * @brief Wrapper for SD card management over SPI bus using FATFS.
+ * @brief Wrapper for SD card management over SPI or SDMMC (1-bit / 4-bit) using FATFS.
  */
 class SdCard {
 public:
@@ -48,7 +48,7 @@ public:
 
     /**
      * @brief Construct a new Sd Card manager.
-     * @param config SPI pins and filesystem settings.
+     * @param config Interface mode, pins and filesystem settings.
      */
     explicit SdCard(const Config& config);
     
@@ -61,13 +61,13 @@ public:
     SdCard& operator=(const SdCard&) = delete;
 
     /**
-     * @brief Initialize the SPI bus and mount the FAT filesystem.
+     * @brief Initialize the host interface (SPI bus or SDMMC slot) and mount the FAT filesystem.
      * @return esp_err_t ESP_OK on success.
      */
     [[nodiscard]] esp_err_t init();
 
     /**
-     * @brief Unmount the filesystem and free SPI bus resources.
+     * @brief Unmount the filesystem and free the host interface resources (the SPI bus when in SPI mode).
      * @return esp_err_t ESP_OK on success.
      */
     [[nodiscard]] esp_err_t deinit();
